@@ -1,77 +1,90 @@
 # FlowScope
 
-**Live trades, market pressure and a closer look at the next ten seconds.**
+**A clearer view of real-time market order flow.**
 
-FlowScope is a lightweight market-research dashboard for watching public cryptocurrency trade executions across multiple exchanges. The idea is simple: one clean screen where you can see incoming buys and sells, compare aggressive volume, and follow whether pressure is building or fading.
+FlowScope is a free, mobile-friendly research terminal for individual, publicly reported crypto executions. It brings live venue activity, buy-versus-sell taker pressure, independent ten-second observations, and data-quality diagnostics into one view.
 
-**Live site:** [FlowScope on Vercel](https://flowscope-live-tape-maan-0a06.vercel.app)
+[Open the live terminal](https://flowscope-live-tape-maan-0a06.vercel.app)
 
-## Preview
+## Screenshots
 
-![Desktop overview](docs/screenshots/desktop.jpg)
+![FlowScope desktop terminal](docs/screenshots/desktop.jpg)
 
-<p align="center"><img src="docs/screenshots/mobile.jpg" alt="FlowScope mobile dashboard" width="320"></p>
+<img src="docs/screenshots/mobile.jpg" alt="FlowScope mobile terminal" width="340">
 
-The screenshots show the interface in a disconnected preview environment. Figures are intentionally empty until a live exchange feed connects. The application never fabricates market trades.
+*Interface screenshots were captured with no live market connection. They are not simulated market data or historical performance results.*
 
-## What it does
+## Highlights
 
-- Watches individual public trade prints from Binance, Coinbase, Kraken, OKX, Bybit, Gate.io, Bitstamp and Bitget when their public WebSocket markets are available.
-- Supports BTC, ETH, SOL, and PAXG (tokenized gold) spot pairs.
-- Calculates rolling buyer-initiated vs seller-initiated traded notional over 15 seconds, 30 seconds, 1 minute or 5 minutes.
-- Separates **connected** sockets from venues that are actually **receiving** trades.
-- Shows growing green/red strength indicators when a smoothed pressure trend persists, with confirmation periods to filter small changes.
-- Records 10-second pressure outcomes and compares them with similar past conditions. An estimated continuation rate is withheld until at least 20 comparable verified checks exist.
-- Lets you filter the latest execution tape by exchange, aggressor side and minimum trade value.
-- Keeps a small amount of verified outcome history locally in the browser.
+- Public trade feeds from Binance, Coinbase Exchange, Kraken, OKX, Bybit, Gate.io, Bitstamp and Bitget, with status indicators for feeds that are unavailable or not receiving data.
+- BTC, ETH, SOL and PAXG spot-market views. PAXG is tokenized gold and is not the OTC XAU/USD gold market.
+- Exchange-aware prices: the displayed reference is labeled **Binance `ASSET/USDT`**, not a consolidated market price. Execution rows keep each venue's original USD or USDT quote unit.
+- Trade-event timestamps displayed in the visitor's local timezone with milliseconds, plus measured arrival lag and feed freshness.
+- Pressure computed using **all accepted trade messages in second-level aggregates**, even when the visible tape is capped to preserve browser performance.
+- Clear distinction between **dominance** (which side is stronger) and **momentum** (how that balance has changed). A green streak cannot count as buy dominance while sellers lead the window.
+- A single BUY, SELL, or WAIT ten-second outlook. Predictions are evaluated against a **non-overlapping future interval**; the engine never records an artificial opposite-side prediction at the same timestamp.
+- Historical forecast verification in local browser storage. Empirical rates remain hidden until a sufficient sample of matching observed outcomes exists.
+- Automatic WebSocket reconnection, stale-feed warnings, duplicate trade-ID filtering, and no user accounts or exchange API keys.
 
-## Run locally
+## Start locally
 
-No installation, account or API key is needed. This is a static HTML/CSS/JavaScript project.
+This project is plain HTML, CSS and JavaScript. No build tool or server-side account credentials are required.
 
 ```bash
 python -m http.server 8080
 ```
 
-Open `http://localhost:8080`. Use any standard static file server or deploy the folder to Vercel. The site opens WebSocket connections directly from the browser.
+Then open [http://localhost:8080](http://localhost:8080).
 
-## How to read the pressure
+### Test the calculations
 
-A public trade has both a buyer and seller. A **buy** print in FlowScope refers to the more aggressive participant crossing the spread to buy; it does not mean there are more buyers than sellers. For the selected window:
+Node.js 20+ is recommended:
 
-```text
-Buy pressure (%) = buyer-initiated notional / all observed notional × 100
-Net taker delta  = buyer-initiated notional − seller-initiated notional
+```bash
+npm test
+npm run check
 ```
 
-A green or red timer measures how long a *filtered increase in that side's pressure* has persisted. The effect strengthens with the duration of the streak; it does **not** mean a prediction is becoming certain. Short-lived changes are ignored using exponential smoothing, a threshold and a confirmation period.
+The calculation tests cover timestamp rejection, separate dominance/momentum, rolling windows, volume aggregation under a capped trade tape, and directional forecast verification.
 
-The 10-second outlook studies similar observed conditions and labels whether pressure increased, decreased or stayed roughly flat after ten seconds. It is intentionally cautious about sparse samples. That model has not been independently backtested against an external benchmark and must not be treated as a live trading recommendation.
+## Understanding the model
+
+A trade always has both a buyer and seller. "Buy pressure" means buying is the **aggressive taker side** of observed public executions. It does not identify traders or reveal every order submitted to an exchange.
+
+```text
+Buy-share (%) = aggressive buy notional / (aggressive buy + aggressive sell notional) × 100
+Taker delta   = aggressive buy notional − aggressive sell notional
+```
+
+For each permitted ten-second assessment, FlowScope examines the preceding two non-overlapping ten-second observations and a broader trend baseline. It also requires recent trades from more than one venue and basic agreement across those venues. If the evidence is insufficient, the model **abstains**.
+
+A completed assessment is compared with the following ten-second flow window. A 2-percentage-point deadband classifies small changes as *flat*. Flat/invalid labels are not silently counted as correct predictions. Empirical continuation percentages are withheld until enough comparable outcomes have accumulated.
+
+**These are experimental pressure forecasts, not backtested price predictions.** A valid pressure prediction does not establish a profitable trading strategy.
+
+## Limitations worth knowing
+
+- Some public WebSocket endpoints are blocked or restricted by region, product, device or network.
+- Browser sessions cannot guarantee uninterrupted collection when a phone sleeps or a tab is backgrounded; missing periods are never filled with made-up trades.
+- USD and USDT quote assets are different. Their venue prices and price charts should not be treated as identical. Cross-venue notionals are approximate USD equivalents, not FX-converted dollar accounting.
+- Market quality indicators and estimated accuracy require historical out-of-sample validation before operational use.
+- A high number of individual executions is not necessarily the number of distinct orders or users.
+- This project **does not connect to a broker, place orders, or provide financial advice**.
 
 ## Project structure
 
 ```text
-flowscope/
-├── index.html             # Page structure
-├── src/
-│   ├── styles.css         # Responsive design and pressure effects
-│   └── app.js             # Exchange streams, aggregation and outlooks
-├── docs/screenshots/
-│   ├── desktop.jpg
-│   └── mobile.jpg
-├── vercel.json
-├── .gitignore
-└── README.md
+index.html                   Dashboard structure
+src/styles.css               Responsive terminal design
+src/app.js                   WebSocket adapters, state and UI
+src/engine.js                Pure market calculations
+tests/engine.test.js        Node tests for calculation rules
+ docs/screenshots/           Desktop and mobile interface captures
+vercel.json                  Static deployment configuration
 ```
 
-## Things worth knowing
+## Maintainer
 
-- A browser-only application cannot capture every global transaction. Some markets are private, do not publish individual executions, or restrict direct WebSocket access.
-- Spot BTC/USD and BTC/USDT are different quote markets; summed USD/USDT notional is approximate, not a perfectly normalized global tape.
-- **PAXG is not XAU/USD.** Tokenized-gold exchange prints should not be used as broker gold order flow.
-- A phone can suspend an inactive page. No new trades are collected while the browser is suspended. Live monitoring resumes after reconnection, but the gap is not backfilled.
-- The dashboard does **not** execute trades, connect to a brokerage account, or handle funds.
+**Inderjeet Singh Maan** · [GitHub](https://github.com/inderjeetsmaan)
 
-## About
-
-FlowScope is an ongoing independent market-data interface project maintained by **Inderjeet Singh Maan**. The focus is clear presentation, practical live exchange monitoring and transparent limitations around market-pressure signals.
+The project is published under the terms in [`LICENSE`](LICENSE).

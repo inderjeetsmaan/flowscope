@@ -1,409 +1,193 @@
-/* FlowScope — market-data client and ten-second pressure observation. */
+/* FlowScope: market feeds, honest signal lab, and terminal UI. */
 (() => {
   'use strict';
-
-  const $ = id => document.getElementById(id);
-  const venues = ['Binance', 'Coinbase', 'Kraken', 'OKX', 'Bybit', 'Gate.io', 'Bitstamp', 'Bitget'];
-  const storageKey = 'flowscope.verified-pressure.v1';
-  const formatPrice = n => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: n < 10 ? 5 : 2 });
-  const money = n => n >= 1e9 ? `$${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `$${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `$${(n / 1e3).toFixed(1)}K` : `$${n.toFixed(2)}`;
-  const clock = time => new Date(time).toLocaleTimeString('en-GB', { hour12: false });
-  const percent = n => n == null ? '—' : `${n.toFixed(1)}%`;
-
-  const state = {
-    symbol: 'BTC', window: 60, generation: 0, feeds: new Map(), seconds: new Map(),
-    recent: [], last: null, total: 0, startTime: Date.now(), lastVerified: null,
-    pending: [], completed: [], lastSampleAt: 0, lastPredictionAt: 0,
-    ema: null,
-    streaks: { BUY: newStreak(), SELL: newStreak() },
-    priceTrace: [], lastSnapshot: null
-  };
-  function newStreak() { return { base: null, started: 0, candidate: 0, falling: 0 }; }
-
-  function loadHistory() {
-    try {
-      const data = JSON.parse(localStorage.getItem(storageKey) || '[]');
-      state.completed = Array.isArray(data) ? data.filter(x => x && Number.isFinite(x.at) && ['BUY', 'SELL'].includes(x.side)).slice(-600) : [];
-    } catch { state.completed = []; }
+  const E = window.FlowEngine;
+  if (!E) throw new Error('FlowEngine missing');
+  const $ = (id) => document.getElementById(id);
+  const VENUES = ['Binance', 'Coinbase', 'Kraken', 'OKX', 'Bybit', 'Gate.io', 'Bitstamp', 'Bitget'];
+  const QUOTES = { BTC: ['USDT','USD'], ETH: ['USDT','USD'], SOL: ['USDT','USD'], PAXG: ['USDT','USD'] };
+  const fmtMoney = (n, precision=2) => n === null || !Number.isFinite(n) ? '—' : '$' + Number(n).toLocaleString('en-US',{minimumFractionDigits:precision,maximumFractionDigits:precision});
+  const fmtCompact = n => !Number.isFinite(n) ? '—' : (n >= 1e9 ? '$'+(n/1e9).toFixed(2)+'B' : n>=1e6?'$'+(n/1e6).toFixed(2)+'M':n>=1000?'$'+(n/1000).toFixed(1)+'K':fmtMoney(n));
+  const pct = n => n == null ? '—' : n.toFixed(1) + '%';
+  const msLabel = n => n == null ? '—' : (n>=1000?(n/1000).toFixed(1)+'s':Math.round(n)+'ms');
+  const age = n => n ? Math.max(0,Math.floor((Date.now()-n)/1000))+'s ago' : 'Never';
+  const marketKey = (asset, venue) => (venue==='Coinbase'||venue==='Kraken'||venue==='Bitstamp') ? asset+'/USD':asset+'/USDT';
+  const displayDate = ts => E.displayTime(ts, Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
+  const displayFull = ts => displayDate(ts)+'.'+String(ts%1000).padStart(3,'0');
+  const resultsKey = 'flowscope-v2-verified-forecasts';
+  const selectedKey = 'flowscope-v2-asset';
+  let savedAsset = 'BTC'; try { savedAsset=localStorage.getItem(selectedKey)||'BTC' }catch{}
+  let asset = ['BTC','ETH','SOL','PAXG'].includes(savedAsset) ? savedAsset : 'BTC';
+  let period = 60, epoch = 0, feeds = {}, recent = [], buckets = new Map(), series = [], outcomes = [], pending = null, total = 0;
+  let startedAt = Date.now(), lastTrade = null, lastReference = null, lastForecastStart = 0, lastResult = null;
+  let strength = { side:'NONE',since:0,candidate:null,changeAt:0 }, momentumSmooth = 50, lastRenderAt = 0;
+  let visible = !document.hidden;
+  const LIMIT = 30000, STORE_LIMIT = 600, RENDER_LIMIT = 75;
+  const venueStatus = n => feeds[n]?.state || 'OFFLINE';
+  try { const raw=JSON.parse(localStorage.getItem(resultsKey)||'[]'); if(Array.isArray(raw)) outcomes=raw.filter(x=>x && x.asset && x.timestamp && x.features).slice(-STORE_LIMIT) } catch {}
+  function persist() { try { localStorage.setItem(resultsKey,JSON.stringify(outcomes.slice(-STORE_LIMIT))) }catch{} }
+  function adapter(name) {
+    const A=asset, pair=A+'USDT', coin=A+'-USD';
+    const put = (side,p,q,time,id) => accept({venue:name,asset:A,quote:marketKey(A,name).split('/')[1],side,price:p,quantity:q,time,tradeId:id});
+    if(name==='Binance') return {url:'wss://data-stream.binance.vision/ws/'+pair.toLowerCase()+'@trade', parse:d=>{if(d.e==='trade')put(d.m?'SELL':'BUY',d.p,d.q,d.T,d.t)}};
+    if(name==='Coinbase') return {url:'wss://ws-feed.exchange.coinbase.com', subscribe:{type:'subscribe',product_ids:[coin],channels:['matches']}, parse:d=>{if(d.type==='match')put(d.side==='buy'?'SELL':'BUY',d.price,d.size,Date.parse(d.time),d.trade_id)}};
+    if(name==='Kraken') return {url:'wss://ws.kraken.com/v2',subscribe:{method:'subscribe',params:{channel:'trade',symbol:[A+'/USD']}},parse:d=>{if(d.channel==='trade'&&Array.isArray(d.data))for(const t of d.data)put(t.side,t.price,t.qty,Date.parse(t.timestamp),t.trade_id)}};
+    if(name==='OKX') return {url:'wss://ws.okx.com:8443/ws/v5/public',subscribe:{op:'subscribe',args:[{channel:'trades',instId:A+'-USDT'}]},parse:d=>{if(d.arg?.channel==='trades'&&Array.isArray(d.data))for(const t of d.data)put(t.side,t.px,t.sz,t.ts,t.tradeId)}};
+    if(name==='Bybit') return {url:'wss://stream.bybit.com/v5/public/spot',subscribe:{op:'subscribe',args:['publicTrade.'+pair]},ping:JSON.stringify({op:'ping'}),parse:d=>{if(d.topic?.startsWith('publicTrade.')&&Array.isArray(d.data))for(const t of d.data)put(t.S,t.p,t.v,t.T,t.i)}};
+    if(name==='Gate.io') return {url:'wss://api.gateio.ws/ws/v4/', subscribe:{time:Math.floor(Date.now()/1000),channel:'spot.trades',event:'subscribe',payload:[A+'_USDT']}, parse:d=>{if(d.channel==='spot.trades'&&d.event==='update'){const items=Array.isArray(d.result)?d.result:[d.result];for(const t of items)if(t)put(t.side,t.price,t.amount,Number(t.create_time_ms)||Number(t.create_time)*1000,t.id)}}};
+    if(name==='Bitstamp') return {url:'wss://ws.bitstamp.net',subscribe:{event:'bts:subscribe',data:{channel:'live_trades_'+A.toLowerCase()+'usd'}},parse:d=>{if(d.event==='trade'&&d.data){const t=d.data;put(Number(t.type)===0?'BUY':Number(t.type)===1?'SELL':'UNKNOWN',t.price,t.amount,t.microtimestamp?Number(t.microtimestamp)/1000:Number(t.timestamp)*1000,t.id)}}};
+    if(name==='Bitget') return {url:'wss://ws.bitget.com/v2/ws/public',subscribe:{op:'subscribe',args:[{instType:'SPOT',channel:'trade',instId:pair}]},ping:'ping',parse:d=>{if(d.arg?.channel==='trade'&&Array.isArray(d.data))for(const t of d.data){if(Array.isArray(t))put(t[3],t[1],t[2],t[0],t[4]);else put(t.side,t.price||t.p,t.size||t.sz,t.ts,t.tradeId||t.id)}}};
+    return null;
   }
-  function persistHistory() {
-    try { localStorage.setItem(storageKey, JSON.stringify(state.completed.slice(-600))); } catch { /* Private browser mode may block storage. */ }
-  }
-
-  function accept(name, side, price, qty, timestamp, tradeId) {
-    const f = state.feeds.get(name), p = Number(price), q = Number(qty), t = Number(timestamp) || Date.now();
-    side = String(side).toUpperCase();
-    if (!f || !['BUY', 'SELL'].includes(side) || !Number.isFinite(p * q) || p <= 0 || q <= 0 || Math.abs(Date.now() - t) > 90000) return;
-    if (tradeId !== undefined && tradeId !== null && tradeId !== '') {
-      const id = `${name}:${state.symbol}:${tradeId}`;
-      if (f.ids.has(id)) return;
-      f.ids.add(id);
-      if (f.ids.size > 10000) f.ids.clear();
-    }
-    const record = { name, side, price: p, value: p * q, t };
-    state.recent.unshift(record);
-    if (state.recent.length > 6000) state.recent.length = 6000;
-    state.priceTrace.push(record);
-    if (state.priceTrace.length > 120) state.priceTrace.shift();
-    state.last = record;
-    state.total++;
-    f.received++;
-    f.lastTradeAt = Date.now();
-    f.status = 'receiving';
-    const key = Math.floor(t / 1000);
-    let bucket = state.seconds.get(key);
-    if (!bucket) {
-      bucket = { buy: 0, sell: 0, count: 0, venues: new Set() };
-      state.seconds.set(key, bucket);
-    }
-    bucket[side === 'BUY' ? 'buy' : 'sell'] += p * q;
+  function accept(raw) {
+    const trade=E.normalize(raw),f=feeds[raw.venue];
+    if(!trade||!f)return;
+    const key=trade.tradeId && raw.venue+':'+asset+':'+trade.tradeId;
+    if(key){if(f.ids.has(key))return;f.ids.add(key);if(f.ids.size>14000)f.ids.clear()}
+    recent.push(trade);
+    const sec = Math.floor(trade.time / 1000);
+    let bucket = buckets.get(sec);
+    if(!bucket){bucket={buy:0,sell:0,count:0,byVenue:new Map()};buckets.set(sec,bucket)}
+    bucket[trade.side==='BUY'?'buy':'sell']+=trade.value;
     bucket.count++;
-    bucket.venues.add(name);
-  }
-
-  function settings(name) {
-    const asset = state.symbol, usdt = asset + 'USDT';
-    switch (name) {
-      case 'Binance': return {
-        url: `wss://data-stream.binance.vision/ws/${usdt.toLowerCase()}@trade`,
-        parse: d => { if (d.e === 'trade') accept(name, d.m ? 'SELL' : 'BUY', d.p, d.q, d.T, d.t); }
-      };
-      case 'Coinbase': return {
-        url: 'wss://ws-feed.exchange.coinbase.com',
-        subscribe: { type: 'subscribe', product_ids: [`${asset}-USD`], channels: ['matches'] },
-        parse: d => { if (d.type === 'match') accept(name, d.side === 'buy' ? 'SELL' : 'BUY', d.price, d.size, Date.parse(d.time), d.trade_id); }
-      };
-      case 'Kraken': return {
-        url: 'wss://ws.kraken.com/v2',
-        subscribe: { method: 'subscribe', params: { channel: 'trade', symbol: [`${asset}/USD`] } },
-        parse: d => { if (d.channel === 'trade' && Array.isArray(d.data)) d.data.forEach(x => accept(name, x.side, x.price, x.qty, Date.parse(x.timestamp), x.trade_id)); }
-      };
-      case 'OKX': return {
-        url: 'wss://ws.okx.com:8443/ws/v5/public',
-        subscribe: { op: 'subscribe', args: [{ channel: 'trades', instId: `${asset}-USDT` }] },
-        parse: d => { if (d.arg?.channel === 'trades' && Array.isArray(d.data)) d.data.forEach(x => accept(name, x.side, x.px, x.sz, x.ts, x.tradeId)); }
-      };
-      case 'Bybit': return {
-        url: 'wss://stream.bybit.com/v5/public/spot',
-        subscribe: { op: 'subscribe', args: [`publicTrade.${usdt}`] },
-        ping: JSON.stringify({ op: 'ping' }),
-        parse: d => { if (d.topic?.startsWith('publicTrade.') && Array.isArray(d.data)) d.data.forEach(x => accept(name, x.S, x.p, x.v, x.T, x.i)); }
-      };
-      case 'Gate.io': return {
-        url: 'wss://api.gateio.ws/ws/v4/',
-        subscribe: { time: Math.floor(Date.now() / 1000), channel: 'spot.trades', event: 'subscribe', payload: [`${asset}_USDT`] },
-        parse: d => {
-          if (d.channel !== 'spot.trades' || d.event !== 'update') return;
-          for (const x of Array.isArray(d.result) ? d.result : [d.result]) {
-            if (x) accept(name, x.side, x.price, x.amount, Number(x.create_time_ms) || Number(x.create_time) * 1000, x.id);
-          }
-        }
-      };
-      case 'Bitstamp': return {
-        url: 'wss://ws.bitstamp.net',
-        subscribe: { event: 'bts:subscribe', data: { channel: `live_trades_${asset.toLowerCase()}usd` } },
-        parse: d => {
-          if (d.event !== 'trade' || !d.data) return;
-          const x = d.data;
-          accept(name, Number(x.type) === 0 ? 'BUY' : Number(x.type) === 1 ? 'SELL' : 'UNKNOWN', x.price, x.amount, Number(x.microtimestamp) ? Number(x.microtimestamp) / 1000 : Number(x.timestamp) * 1000, x.id);
-        }
-      };
-      case 'Bitget': return {
-        url: 'wss://ws.bitget.com/v2/ws/public',
-        subscribe: { op: 'subscribe', args: [{ instType: 'SPOT', channel: 'trade', instId: usdt }] },
-        ping: 'ping',
-        parse: d => {
-          if (d.arg?.channel !== 'trade' || !Array.isArray(d.data)) return;
-          for (const x of d.data) {
-            if (Array.isArray(x)) accept(name, x[3], x[1], x[2], x[0], x[4]);
-            else accept(name, x.side, x.price ?? x.p, x.size ?? x.sz, x.ts, x.tradeId ?? x.id);
-          }
-        }
-      };
+    const vb=bucket.byVenue.get(trade.venue)||{buy:0,sell:0,count:0};
+    vb[trade.side==='BUY'?'buy':'sell']+=trade.value;vb.count++;bucket.byVenue.set(trade.venue,vb);
+    total++;f.prints++;f.lastTradeAt=Date.now();f.lastPacketAt=Date.now();f.state='RECEIVING';f.lastQuote=trade;
+    lastTrade=trade;
+    if(trade.venue==='Binance') {
+      lastReference=trade;series.push({t:trade.time,p:trade.price});
+      if(series.length>4000)series.splice(0,series.length-4000);
     }
+    if(recent.length>LIMIT)recent.splice(0,recent.length-LIMIT);
   }
-
-  function disconnect(feed) {
-    if (feed?.retryTimer) clearTimeout(feed.retryTimer);
-    if (feed) feed.retryTimer = null;
-    if (feed?.socket) {
-      const socket = feed.socket;
-      feed.socket = null;
-      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
-      try { socket.close(); } catch { /* Already disconnected. */ }
+  function closeFeed(f) {
+    if(f.timer)clearTimeout(f.timer);f.timer=null;
+    if(f.ws){const s=f.ws;f.ws=null;s.onclose=s.onopen=s.onerror=s.onmessage=null;try{s.close()}catch{}}
+  }
+  function reconnect(name,why){const f=feeds[name];if(!f||f.unsupported)return;closeFeed(f);f.state='RETRYING';f.error=why;f.attempt++;f.timer=setTimeout(()=>{f.timer=null;openFeed(name)},Math.min(35000,1250*2**Math.min(f.attempt,5))+Math.random()*500)}
+  function openFeed(name){const f=feeds[name];if(!f||f.unsupported)return;closeFeed(f);f.state='CONNECTING';f.openAt=Date.now();f.lastPacketAt=Date.now();const generation=epoch;let socket;try{socket=new WebSocket(f.adapter.url)}catch{return reconnect(name,'WebSocket blocked')}
+    f.ws=socket;
+    socket.onopen=()=>{if(generation!==epoch||f.ws!==socket)return;f.state='CONNECTED';f.attempt=0;f.lastPacketAt=Date.now();try{if(f.adapter.subscribe)socket.send(JSON.stringify(f.adapter.subscribe))}catch{reconnect(name,'Subscription failed')}};
+    socket.onmessage=e=>{if(generation!==epoch||f.ws!==socket)return;f.lastPacketAt=Date.now();try{
+      const d=JSON.parse(e.data);
+      if(d.event==='error'||d.success===false||(d.code&&d.msg&&String(d.code)!=='0')){reconnect(name,'Exchange rejected subscription');return}
+      f.adapter.parse(d);
+    }catch(err){f.error='Unrecognized message'}};
+    socket.onerror=()=>{if(f.ws===socket)reconnect(name,'Socket error')};
+    socket.onclose=()=>{if(f.ws===socket)reconnect(name,'Disconnected')};
+  }
+  function boot(){epoch++;Object.values(feeds).forEach(closeFeed);feeds={};recent=[];buckets.clear();series=[];total=0;lastTrade=lastReference=null;pending=null;lastForecastStart=0;lastResult=null;startedAt=Date.now();strength={side:'NONE',since:0,candidate:null,changeAt:0};momentumSmooth=50;
+    for(const name of VENUES){const unsupported=asset==='PAXG'&&['Bybit','Bitstamp','Bitget'].includes(name);feeds[name]={adapter:unsupported?null:adapter(name),unsupported,state:unsupported?'NOT ENABLED':'CONNECTING',ws:null,timer:null,attempt:0,error:'',openAt:0,lastPacketAt:0,lastTradeAt:0,prints:0,ids:new Set(),lastQuote:null};}
+    for(const name of VENUES)if(!feeds[name].unsupported)openFeed(name);
+    document.querySelectorAll('[data-symbol]').forEach(b=>b.classList.toggle('active',b.dataset.symbol===asset));
+    $('noticeGold').hidden=asset!=='PAXG';$('symbolCode').textContent=asset+'/USDT · Binance spot reference';render();
+  }
+  function watchdog(){if(document.hidden)return;const now=Date.now();for(const n of VENUES){const f=feeds[n];if(f.unsupported)continue;
+    if(f.ws?.readyState===WebSocket.CONNECTING&&now-f.openAt>16000)reconnect(n,'Handshake timeout');
+    else if(f.ws?.readyState===WebSocket.OPEN&&now-f.lastPacketAt>80000)reconnect(n,'No packets');
+    else if(!f.ws&&!f.timer)reconnect(n,'Socket absent');
+    else if(f.ws?.readyState===WebSocket.OPEN&&f.adapter.ping&&now-f.lastPacketAt>18000){try{f.ws.send(f.adapter.ping)}catch{reconnect(n,'Ping failed')}}
+  }}
+  function setStreak(candidate,now,valid){
+    if(!valid||candidate==='NONE') {strength={side:'NONE',since:0,candidate:null,changeAt:0};return}
+    if(strength.side===candidate){strength.candidate=null;return}
+    if(strength.candidate?.side!==candidate){strength.candidate={side:candidate,at:now};return}
+    if(now-strength.candidate.at>=3000){strength={side:candidate,since:strength.candidate.at,candidate:null,changeAt:now}}
+  }
+  function streakUI(side){const on=strength.side===side,ts=on?Math.floor((Date.now()-strength.since)/1000):0,id=side==='BUY'?'buy':'sell',level=ts>=180?4:ts>=60?3:ts>=25?2:ts>0?1:0;
+    $(id+'Streak').textContent=on?String(Math.floor(ts/60)).padStart(2,'0')+':'+String(ts%60).padStart(2,'0'):'00:00';
+    $(id+'Strength').textContent=['IDLE','BUILDING','DEVELOPING','SUSTAINED','EXTENDED'][level];
+    $(id+'Meter').style.width=Math.min(100,ts/180*100)+'%';
+    $(id+'Tile').dataset.level=level;
+    $(id+'StreakDetail').textContent=on?'Dominant direction held across confirmed updates':'No qualifying dominance streak';
+  }
+  const lagMs=()=>lastTrade?Date.now()-lastTrade.receivedAt:Infinity;
+  function calculate(now){const end=Math.floor(now/1000)*1000;const last30=E.summaryBins(buckets,end-30000,end),prev10=E.summaryBins(buckets,end-20000,end-10000),last10=E.summaryBins(buckets,end-10000,end),last60=E.summaryBins(buckets,end-60000,end),window=E.summaryBins(buckets,end-period*1000,end);
+    const liveCount=VENUES.filter(n=>feeds[n]?.lastTradeAt&&now-feeds[n].lastTradeAt<15000).length;
+    const q=E.qualify(window,lagMs(),now-startedAt,{minTrades:40,minVenues:2,minAge:10000});
+    if(liveCount<2)q.reasons.push('VENUE_FEEDS_STALE');q.ok=q.reasons.length===0;
+    return {last30,prev10,last10,last60,window,liveCount,q};
+  }
+  function analyzeForecast(now,c){
+    if(document.hidden){pending=null;return}
+    // A forecast is issued at most once per ten seconds. The target observation is *only* the subsequent ten seconds.
+    if(pending&&now>=pending.until+500){
+      const forward=E.summaryBins(buckets,pending.at,pending.until),result=E.settle(pending,forward,{minForward:20,minVenues:2});
+      if(now-pending.until>4500)result.result='INVALID';
+      const row={timestamp:pending.issuedAt,asset,side:pending.side,baseline:pending.baseline,features:pending.features,result:result.result,delta:result.delta,reason:result.reason};
+      outcomes.push(row);outcomes=outcomes.slice(-STORE_LIMIT);lastResult=row;persist();pending=null;
     }
+    if(pending||!c.q.ok||Date.now()-startedAt<30000)return;
+    if(now-lastForecastStart<10000)return;
+    lastForecastStart=now;
+    const end=Math.floor(now/1000)*1000;
+    const short=E.summaryBins(buckets,end-10000,end),earlier=E.summaryBins(buckets,end-20000,end-10000),main=E.summaryBins(buckets,end-60000,end);
+    const strict=E.qualify(short,lagMs(),now-startedAt,{minTrades:30,minVenues:2,minAge:30000});
+    const decision=E.estimate(short,earlier,main,strict);
+    if(decision.side==='ABSTAIN')return;
+    const futureStart=end+1000; // Skip incomplete current second: no pre-issuance prints leak into target.
+    pending={issuedAt:now,at:futureStart,until:futureStart+10000,asset,side:decision.side,baseline:short.buyPercent,features:decision.features,reason:decision.reason};
   }
-  function scheduleRetry(name, reason) {
-    const f = state.feeds.get(name);
-    if (!f || f.disabled) return;
-    disconnect(f);
-    f.status = 'retrying';
-    f.reason = reason;
-    f.retries++;
-    const wait = Math.min(30000, 1000 * 2 ** Math.min(f.retries, 5)) + Math.random() * 500;
-    f.retryTimer = setTimeout(() => { f.retryTimer = null; connect(name); }, wait);
+  function chart(){const canvas=$('priceCanvas');if(!canvas)return;const context=canvas.getContext('2d');if(!context)return;const r=canvas.getBoundingClientRect();const dpr=Math.min(2,window.devicePixelRatio||1),w=Math.max(240,r.width),h=Math.max(130,r.height);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
+    let points=series.filter(x=>x.t>=Date.now()-180000).slice(-700);
+    if(points.length<2){context.fillStyle='#94adb7';context.font='12px sans-serif';context.fillText('Waiting for Binance spot executions…',18,h/2);return}
+    let lo=Math.min(...points.map(x=>x.p)),hi=Math.max(...points.map(x=>x.p));const pad=(hi-lo)*.12||hi*.0002;lo-=pad;hi+=pad;const start=points[0].t,end=points[points.length-1].t;
+    context.strokeStyle='#274451';context.lineWidth=1;for(let i=0;i<5;i++){let y=16+(h-34)*i/4;context.beginPath();context.moveTo(0,y);context.lineTo(w,y);context.stroke()}
+    context.beginPath();points.forEach((p,i)=>{let x=12+(w-24)*(p.t-start)/Math.max(end-start,1),y=14+(h-34)*(1-(p.p-lo)/(hi-lo));if(i===0)context.moveTo(x,y);else context.lineTo(x,y)});context.strokeStyle=points[points.length-1].p>=points[0].p?'#39dcaa':'#fb718d';context.lineWidth=2;context.stroke();
+    context.fillStyle='#b4c9d0';context.font='11px sans-serif';context.fillText('BINANCE '+asset+'/USDT · LAST '+points.length+' PRINTS',12,13);
+    context.fillText(formatNumber(hi),12,h-4);context.textAlign='right';context.fillText(formatNumber(lo),w-12,h-4);context.textAlign='left';
   }
-  function connect(name) {
-    const f = state.feeds.get(name);
-    if (!f || f.disabled) return;
-    disconnect(f);
-    f.status = 'connecting';
-    f.openingAt = f.lastMessageAt = Date.now();
-    const generation = state.generation;
-    try {
-      const socket = new WebSocket(f.settings.url);
-      f.socket = socket;
-      socket.onopen = () => {
-        if (state.generation !== generation || f.socket !== socket) return;
-        f.status = 'connected';
-        f.retries = 0;
-        f.lastMessageAt = Date.now();
-        if (f.settings.subscribe) socket.send(JSON.stringify(f.settings.subscribe));
-      };
-      socket.onmessage = event => {
-        if (state.generation !== generation || f.socket !== socket) return;
-        f.lastMessageAt = Date.now();
-        try {
-          const message = JSON.parse(event.data);
-          if (message.event === 'error' || message.success === false) {
-            scheduleRetry(name, 'Subscription rejected');
-            return;
-          }
-          f.settings.parse(message);
-        } catch { f.reason = 'Unrecognized message'; }
-      };
-      socket.onerror = () => { if (f.socket === socket) scheduleRetry(name, 'Network error'); };
-      socket.onclose = () => { if (f.socket === socket) scheduleRetry(name, 'Disconnected'); };
-    } catch { scheduleRetry(name, 'WebSocket unavailable'); }
+  function formatNumber(n){return n.toLocaleString('en-US',{maximumFractionDigits:n<10?5:2})}
+  function row(id,value){$(id).textContent=value}
+  function render(){const now=Date.now();lastRenderAt=now;
+    for (const second of buckets.keys()) if(second < Math.floor((now-380000)/1000)) buckets.delete(second);const c=calculate(now);analyzeForecast(now,c);
+    const {window:w,last10,last30,last60,q,liveCount}=c,connected=VENUES.filter(n=>feeds[n]?.ws?.readyState===WebSocket.OPEN).length;
+    $('statusLed').classList.toggle('active',liveCount>0);row('connectionState',liveCount?`${liveCount} RECEIVING · ${connected} CONNECTED`:connected?`${connected} CONNECTED · WAITING`:'CONNECTING / BLOCKED');
+    const freshRef=lastReference&&now-lastReference.receivedAt<10000;
+    row('referencePrice',freshRef?formatNumber(lastReference.price)+' USDT':'—');
+    row('referenceAge',freshRef?`Binance BTC/USDT`.replace('BTC',asset)+` · trade ${displayFull(lastReference.time)} · ${age(lastReference.receivedAt)}`:'Reference feed unavailable or stale');
+    row('referenceLatency',freshRef?msLabel(Math.max(0,lastReference.receivedAt-lastReference.time)):'—');
+    row('lastVenue',lastTrade?`${lastTrade.venue} ${lastTrade.asset}/${lastTrade.quote} · ${displayFull(lastTrade.time)}`:'No verified trades received');
+    row('buyNotional',fmtCompact(w.buy));row('sellNotional',fmtCompact(w.sell));row('buyPercent',pct(w.buyPercent));row('sellPercent',w.buyPercent==null?'—':pct(100-w.buyPercent));row('netDelta',w.count?(w.buy>=w.sell?'+':'−')+fmtCompact(Math.abs(w.buy-w.sell)):'—');
+    $('netDelta').className=w.buy>=w.sell?'positive':'negative';
+    $('pressureBar').classList.toggle('empty',w.buyPercent==null);$('pressureFill').style.width=(w.buyPercent??0)+'%';
+    row('sampleInfo',`${w.count.toLocaleString()} executions / ${w.venueCount} venues · ${period}s`);
+    row('referenceLabel',asset+'/USDT · Binance reference (not a consolidated price)');
+    const dominant=E.direction(w.buyPercent,55,2);const strict=q.ok&&(dominant==='BUY_DOMINANT'||dominant==='SELL_DOMINANT');
+    const nextCandidate=strict?(dominant==='BUY_DOMINANT'?'BUY':'SELL'):'NONE';setStreak(nextCandidate,now,q.ok);streakUI('BUY');streakUI('SELL');
+    row('dominance',!q.ok?'UNCONFIRMED':dominant.replace('_',' '));$('dominance').className=dominant==='BUY_DOMINANT'?'positive':dominant==='SELL_DOMINANT'?'negative':'neutral';
+    row('momentum',last10.buyPercent==null||c.prev10.buyPercent==null?'—':(last10.buyPercent-c.prev10.buyPercent>=0?'+':'')+(last10.buyPercent-c.prev10.buyPercent).toFixed(1)+'pp');
+    row('trendExplanation',!q.ok?'Need more fresh trades from at least two venues.':dominant==='BUY_DOMINANT'?'Buy-side notional dominates the selected window.':dominant==='SELL_DOMINANT'?'Sell-side notional dominates the selected window.':'Neither side dominates beyond the noise band.');
+    row('quality',q.ok?'LIVE SAMPLE · not a price signal':`QUALITY HOLD · ${q.reasons.join(' · ')||'waiting'}`);
+    row('trend30',pct(last30.buyPercent));row('trend60',pct(last60.buyPercent));
+    const d= pending ? {side:pending.side,reason:pending.reason,features:pending.features} : {side:'ABSTAIN',reason:q.ok?'No qualifying, non-overlapping 10-second forecast right now.':'Not enough live coverage.'};
+    row('forecastDirection',pending?(d.side==='BUY'?'BUY PRESSURE ↑':'SELL PRESSURE ↑'):'WAIT / NO EDGE');
+    $('forecastDirection').className=pending?(d.side==='BUY'?'positive':'negative'):'neutral';
+    row('forecastReason',d.reason);row('forecastCountdown',pending?Math.max(0,Math.ceil((pending.until-now)/1000))+'s to outcome':'—');
+    const assetOutcomes=outcomes.filter(x=>x.asset===asset),valid=assetOutcomes.filter(x=>x.result==='CORRECT'||x.result==='WRONG'),wins=valid.filter(x=>x.result==='CORRECT').length;
+    const matched= pending?E.rateFor(assetOutcomes,pending.features):{count:0,rate:null};
+    row('empiricalRate',pending?(matched.rate==null?`UNVERIFIED · ${matched.count}/30 comparable`:matched.rate.toFixed(1)+'% observed continuation · '+matched.count+' checks'):'Awaiting validated forecast');
+    row('forecastTrack',pending?'OPEN · 10s forward window':'—');
+    row('forecastStatus',valid.length>=30?`${(100*wins/valid.length).toFixed(1)}% directional hits · ${valid.length} checks`:`${valid.length}/30 directional outcomes · unvalidated`);
+    row('lastOutcome',lastResult?`${lastResult.side}: ${lastResult.result}`:'No completed forecast yet');
+    row('outcomeDetails',lastResult?`${lastResult.delta==null?'—':(lastResult.delta>=0?'+':'')+lastResult.delta.toFixed(2)+'pp'} · ${displayDate(lastResult.timestamp)}`:'Forecasts require a complete, observed next 10s');
+    row('observations',outcomes.filter(x=>x.asset===asset).length.toLocaleString()+' recorded outcomes');
+    row('totalReceived',total.toLocaleString()+' received');row('bufferSize',recent.length.toLocaleString()+' retained; latest '+RENDER_LIMIT+' displayed');
+    row('timezone',Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC');
+    $('venueRows').innerHTML=VENUES.map(n=>{const f=feeds[n],fresh=f.lastTradeAt&&now-f.lastTradeAt<15000;const label=f.unsupported?'NOT ENABLED':fresh?'RECEIVING':f.state==='RECEIVING'?'QUIET / STALE':f.state;return `<div class="venue-row"><span><i class="led-small ${fresh?'good':f.unsupported?'bad':''}"></i><b>${n}</b><small>${asset}/${marketKey(asset,n).split('/')[1]}</small></span><span class="venue-right">${label}<small>${f.prints.toLocaleString()} prints · ${age(f.lastTradeAt)}</small></span></div>`}).join('');
+    const filterVenue=$('filterVenue').value,filterSide=$('filterSide').value,min=Number($('minTrade').value)||0;
+    const display=recent.filter(t=>(filterVenue==='ALL'||filterVenue===t.venue)&&(filterSide==='ALL'||filterSide===t.side)&&t.value>=min).slice(-RENDER_LIMIT).reverse();
+    $('tapeRows').innerHTML=display.length?display.map(t=>`<tr><td>${displayFull(t.time)}</td><td>${t.venue}<small>${t.quote}</small></td><td class="${t.side==='BUY'?'positive':'negative'}">${t.side}</td><td>${formatNumber(t.price)} <small>${t.quote}</small></td><td>${fmtCompact(t.value)}</td></tr>`).join(''):'<tr><td class="empty" colspan="5">No matching public executions received yet.</td></tr>';
+    $('historyRows').innerHTML=assetOutcomes.length?assetOutcomes.slice(-12).reverse().map(x=>`<tr><td>${displayDate(x.timestamp)}</td><td>${x.side}</td><td>${x.result}</td><td>${x.delta==null?'—':(x.delta>=0?'+':'')+x.delta.toFixed(2)+'pp'}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">Waiting for verified non-overlapping observations.</td></tr>';
+    chart();
   }
-  function resetTrend() {
-    state.ema = null;
-    state.streaks = { BUY: newStreak(), SELL: newStreak() };
-    state.pending = [];
-    state.lastPredictionAt = 0;
-  }
-  function startSymbol() {
-    state.generation++;
-    for (const f of state.feeds.values()) disconnect(f);
-    state.feeds.clear();
-    state.seconds.clear();
-    state.recent = [];
-    state.priceTrace = [];
-    state.last = null;
-    state.total = 0;
-    state.startTime = Date.now();
-    resetTrend();
-    for (const name of venues) {
-      const disabled = state.symbol === 'PAXG' && ['Bybit', 'Bitstamp', 'Bitget'].includes(name);
-      state.feeds.set(name, {
-        name, disabled, settings: settings(name), socket: null, retryTimer: null,
-        retries: 0, received: 0, lastTradeAt: 0, lastMessageAt: 0, openingAt: 0,
-        status: disabled ? 'unavailable' : 'connecting', reason: '', ids: new Set()
-      });
-    }
-    for (const name of venues) if (!state.feeds.get(name).disabled) connect(name);
-    $('goldNotice').hidden = state.symbol !== 'PAXG';
-    render();
-  }
-  function watchdog() {
-    const now = Date.now();
-    for (const name of venues) {
-      const f = state.feeds.get(name);
-      if (!f || f.disabled) continue;
-      const s = f.socket;
-      if (s?.readyState === WebSocket.CONNECTING && now - f.openingAt > 16000) scheduleRetry(name, 'Handshake timed out');
-      else if (s?.readyState === WebSocket.OPEN && now - f.lastMessageAt > 85000) scheduleRetry(name, 'Feed stopped responding');
-      else if (!s && !f.retryTimer) scheduleRetry(name, 'Connection unavailable');
-      else if (s?.readyState === WebSocket.OPEN && f.settings.ping && now - f.lastMessageAt > 18000) {
-        try { s.send(f.settings.ping); } catch { scheduleRetry(name, 'Keepalive failed'); }
-      }
-    }
-  }
-
-  function summarize(duration) {
-    const to = Math.floor(Date.now() / 1000), from = to - duration;
-    let buy = 0, sell = 0, count = 0;
-    const active = new Set();
-    for (let second = from; second <= to; second++) {
-      const bucket = state.seconds.get(second);
-      if (!bucket) continue;
-      buy += bucket.buy;
-      sell += bucket.sell;
-      count += bucket.count;
-      for (const name of bucket.venues) active.add(name);
-    }
-    return { buy, sell, count, venues: active.size, ratio: buy + sell ? 100 * buy / (buy + sell) : null };
-  }
-  function updateStreaks(ratio, valid, now) {
-    if (!valid || ratio == null) { resetTrend(); return; }
-    state.ema = state.ema == null ? ratio : .78 * state.ema + .22 * ratio;
-    for (const side of ['BUY', 'SELL']) {
-      const x = state.streaks[side], value = side === 'BUY' ? state.ema : 100 - state.ema;
-      if (x.base == null) x.base = value;
-      if (!x.started) {
-        if (value >= x.base + .7) {
-          x.candidate ||= now;
-          if (now - x.candidate >= 2500) { x.started = x.candidate; x.base = value; x.falling = 0; }
-        } else if (value < x.base - 1.2) { x.base = value; x.candidate = 0; }
-        else x.candidate = 0;
-      } else if (value <= x.base - 1.4) {
-        x.falling ||= now;
-        if (now - x.falling >= 2500) Object.assign(x, newStreak(), { base: value });
-      } else { x.falling = 0; if (value > x.base) x.base = value; }
-    }
-  }
-  function timeString(start) {
-    if (!start) return '00:00';
-    const elapsed = Math.max(0, Math.floor((Date.now() - start) / 1000));
-    return `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
-  }
-  function feature(side, short, long) {
-    const value = side === 'BUY' ? short.ratio : 100 - short.ratio;
-    const reference = side === 'BUY' ? long.ratio : 100 - long.ratio;
-    const streak = state.streaks[side].started ? (Date.now() - state.streaks[side].started) / 1000 : 0;
-    return { symbol: state.symbol, side,
-      duration: streak >= 30 ? 'long' : streak >= 10 ? 'medium' : 'short',
-      strength: value >= 60 ? 'high' : value >= 52 ? 'medium' : 'low',
-      slope: value - reference >= 3 ? 'up' : value - reference <= -3 ? 'down' : 'flat' };
-  }
-  function sameFeature(a, b) {
-    return a.symbol === b.symbol && a.side === b.side && a.duration === b.duration && a.strength === b.strength && a.slope === b.slope;
-  }
-  function assessForecasts(short, long, healthy) {
-    const now = Date.now();
-    for (let i = state.pending.length - 1; i >= 0; i--) {
-      const item = state.pending[i];
-      if (now - item.at < 10000) continue;
-      state.pending.splice(i, 1);
-      if (!healthy || short.ratio == null || now - item.at > 14500) continue;
-      const latest = item.side === 'BUY' ? short.ratio : 100 - short.ratio;
-      const change = latest - item.from;
-      const result = change >= .7 ? 'CONTINUED' : change <= -.7 ? 'REVERSED' : 'FLAT';
-      const checked = { ...item, change, result, checkedAt: now };
-      state.completed.push(checked);
-      state.completed = state.completed.slice(-600);
-      state.lastVerified = checked;
-      persistHistory();
-    }
-    if (!healthy || short.ratio == null || long.ratio == null || now - state.lastPredictionAt < 5000) return;
-    state.lastPredictionAt = now;
-    for (const side of ['BUY', 'SELL']) {
-      state.pending.push({ ...feature(side, short, long), at: now, from: side === 'BUY' ? short.ratio : 100 - short.ratio });
-    }
-  }
-  function showOutlook(side, short, long, healthy) {
-    const prefix = side === 'BUY' ? 'buy' : 'sell';
-    let heading = 'INSUFFICIENT DATA', reason = 'Waiting for sufficient live coverage', probability = 'Not calibrated', width = 0;
-    if (healthy && short.ratio != null && long.ratio != null) {
-      const matches = state.completed.filter(x => sameFeature(x, feature(side, short, long)));
-      if (matches.length < 20) {
-        heading = state.streaks[side].started ? 'ACTIVE · UNVERIFIED' : 'NO CONFIRMED STREAK';
-        reason = `${matches.length}/20 comparable verified outcomes collected`;
-      } else {
-        const successes = matches.filter(x => x.result === 'CONTINUED').length;
-        const rate = 100 * (successes + 1) / (matches.length + 2);
-        heading = rate >= 60 && state.streaks[side].started ? 'LIKELY CONTINUE' : rate <= 40 ? 'REVERSAL RISK' : 'UNCERTAIN';
-        reason = `${matches.length} comparable ten-second checks`;
-        probability = `${rate.toFixed(1)}% observed continuation estimate`;
-        width = rate;
-      }
-    }
-    $(`${prefix}Outlook`).textContent = heading;
-    $(`${prefix}Reason`).textContent = reason;
-    $(`${prefix}Probability`).textContent = probability;
-    $(`${prefix}Likelihood`).style.width = `${width}%`;
-  }
-  function showStreak(side) {
-    const prefix = side === 'BUY' ? 'buy' : 'sell';
-    const start = state.streaks[side].started;
-    const sec = start ? Math.max(0, (Date.now() - start) / 1000) : 0;
-    const level = !start ? 0 : sec < 10 ? 1 : sec < 30 ? 2 : sec < 60 ? 3 : 4;
-    $(`${prefix}Card`).dataset.strength = String(level);
-    $(`${prefix}Timer`).textContent = timeString(start);
-    $(`${prefix}TimerState`).textContent = start ? 'Confirmed increasing pressure' : 'Awaiting confirmed increase';
-    $(`${prefix}Strength`).style.width = `${start ? Math.min(100, sec / 180 * 100) : 0}%`;
-    $(`${prefix}StrengthName`).textContent = ['IDLE', 'BUILDING', 'DEVELOPING', 'STRONG', 'SUSTAINED'][level];
-  }
-
-  function render() {
-    const now = Date.now();
-    for (const second of state.seconds.keys()) if (second < Math.floor((now - 420000) / 1000)) state.seconds.delete(second);
-    const summary = summarize(state.window), short = summarize(30), long = summarize(300);
-    const receiving = venues.filter(name => { const f = state.feeds.get(name); return f?.lastTradeAt && now - f.lastTradeAt < 15000; }).length;
-    const connected = venues.filter(name => state.feeds.get(name)?.socket?.readyState === WebSocket.OPEN).length;
-    const healthy = summary.count >= 30 && summary.venues >= 2 && receiving >= 2 && now - state.startTime >= 10000;
-    updateStreaks(summary.ratio, healthy, now);
-    assessForecasts(short, long, healthy);
-    showStreak('BUY'); showStreak('SELL');
-    showOutlook('BUY', short, long, healthy); showOutlook('SELL', short, long, healthy);
-
-    $('indicator').className = `indicator${receiving ? ' online' : ''}`;
-    $('connectionText').textContent = receiving ? `${receiving} RECEIVING · ${connected} CONNECTED` : connected ? `${connected} CONNECTED · WAITING` : 'RECONNECTING';
-    $('feedCount').textContent = `${receiving} receiving · ${connected} connected`;
-    $('exchangeRows').innerHTML = venues.map(name => {
-      const f = state.feeds.get(name);
-      if (!f) return '';
-      const fresh = f.lastTradeAt && now - f.lastTradeAt < 15000;
-      const status = f.disabled ? 'unavailable' : fresh ? 'receiving' : f.status === 'receiving' ? 'connected · quiet' : f.status;
-      return `<div class="connection-row"><b><i class="${fresh ? 'receiving' : status}"></i>${name}</b><small>${status.toUpperCase()} · ${f.received.toLocaleString()} trades</small></div>`;
-    }).join('');
-
-    $('lastPrice').textContent = state.last ? `$${formatPrice(state.last.price)}` : '—';
-    $('lastDetails').textContent = state.last ? `${state.last.name} · ${clock(state.last.t)}` : 'Waiting for valid executions';
-    $('buyNotional').textContent = summary.count ? money(summary.buy) : '—';
-    $('sellNotional').textContent = summary.count ? money(summary.sell) : '—';
-    $('buyTrades').textContent = `${summary.count} total window prints`;
-    $('sellTrades').textContent = `${summary.count} total window prints`;
-    const delta = summary.buy - summary.sell;
-    $('volumeDelta').textContent = summary.count ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta))}` : '—';
-    $('volumeDelta').className = delta >= 0 ? 'green' : 'red';
-    $('coverageText').textContent = `${summary.count} prints / ${summary.venues} venues`;
-    $('buyPercent').textContent = percent(summary.ratio);
-    $('sellPercent').textContent = summary.ratio == null ? '—' : percent(100 - summary.ratio);
-    $('buyMeter').style.width = `${summary.ratio ?? 50}%`;
-    $('windowCaption').textContent = `Rolling ${state.window} seconds`;
-    $('qualityNote').textContent = healthy ? 'Live-data requirements met. Noise filter: exponential smoothing, 0.7-point change threshold, 2.5-second confirmation. A longer trend is not proof of predictive accuracy.' : 'LOW COVERAGE · At least 30 prints, 2 receiving venues and 10 seconds of observations are needed.';
-
-    $('totalTrades').textContent = `${state.total.toLocaleString()} received`;
-    $('bufferCount').textContent = `${state.recent.length.toLocaleString()} recent prints in memory`;
-    const venue = $('venueFilter').value, side = $('sideFilter').value, min = Math.max(0, Number($('minValue').value) || 0);
-    const shown = state.recent.filter(x => (venue === 'ALL' || x.name === venue) && (side === 'ALL' || x.side === side) && x.value >= min).slice(0, 80);
-    $('tradeRows').innerHTML = shown.length ? shown.map(x => `<tr><td>${clock(x.t)}</td><td>${x.name}</td><td class="${x.side === 'BUY' ? 'green' : 'red'}">${x.side}</td><td>$${formatPrice(x.price)}</td><td>${money(x.value)}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">No matching real executions received yet</td></tr>';
-
-    if (state.priceTrace.length > 1) {
-      const values = state.priceTrace.map(x => x.price), lo = Math.min(...values), hi = Math.max(...values) || lo + 1, range = hi === lo ? 1 : hi - lo;
-      $('pricePath').setAttribute('d', values.map((p, i) => `${i ? 'L' : 'M'}${(i * 500 / (values.length - 1)).toFixed(1)},${(120 - 110 * (p - lo) / range).toFixed(1)}`).join(' '));
-      $('pricePlaceholder').hidden = true;
-    } else { $('pricePath').setAttribute('d', ''); $('pricePlaceholder').hidden = false; }
-
-    const checks = state.completed.filter(x => x.symbol === state.symbol);
-    const directional = checks.filter(x => x.result !== 'FLAT');
-    const successes = directional.filter(x => x.result === 'CONTINUED');
-    $('verifiedCount').textContent = `${checks.length} completed checks`;
-    $('lastOutcome').textContent = state.lastVerified ? `${state.lastVerified.side} ${state.lastVerified.result}` : '—';
-    $('continuationRate').textContent = directional.length ? `${(successes.length / directional.length * 100).toFixed(1)}% (${directional.length} directional)` : '—';
-    $('forecastTimestamp').textContent = state.lastPredictionAt ? clock(state.lastPredictionAt) : '—';
-    $('historyCount').textContent = `${checks.length} outcomes`;
-    $('historyRows').innerHTML = checks.length ? checks.slice(-12).reverse().map(x => `<tr><td>${clock(x.at)}</td><td>${x.symbol}</td><td>${x.side}</td><td>${x.result}</td><td>${x.change >= 0 ? '+' : ''}${x.change.toFixed(1)}pp</td></tr>`).join('') : '<tr><td colspan="5" class="empty">No completed ten-second checks yet</td></tr>';
-  }
-
-  document.querySelectorAll('[data-symbol]').forEach(button => button.addEventListener('click', () => {
-    document.querySelectorAll('[data-symbol]').forEach(x => x.classList.remove('active'));
-    button.classList.add('active');
-    state.symbol = button.dataset.symbol;
-    startSymbol();
-  }));
-  $('windowLength').addEventListener('change', event => { state.window = Number(event.target.value); resetTrend(); render(); });
-  $('reconnect').addEventListener('click', () => { for (const name of venues) if (!state.feeds.get(name)?.disabled) connect(name); render(); });
-  for (const id of ['venueFilter', 'sideFilter', 'minValue']) $(id).addEventListener(id === 'minValue' ? 'input' : 'change', render);
-  $('clearHistory').addEventListener('click', () => { state.completed = state.completed.filter(x => x.symbol !== state.symbol); persistHistory(); render(); });
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) state.pending = []; // Never verify through a known paused period.
-    else { watchdog(); render(); }
-  });
-  window.addEventListener('online', () => { watchdog(); render(); });
-  loadHistory();
-  startSymbol();
-  setInterval(render, 1000);
-  setInterval(watchdog, 7000);
+  document.querySelectorAll('[data-symbol]').forEach(b=>b.addEventListener('click',()=>{asset=b.dataset.symbol;try{localStorage.setItem(selectedKey,asset)}catch{}boot()}));
+  $('periodSelect').addEventListener('change',e=>{period=Number(e.target.value);strength={side:'NONE',since:0,candidate:null,changeAt:0};render()});
+  $('reconnect').addEventListener('click',()=>{for(const n of VENUES)if(!feeds[n].unsupported){feeds[n].attempt=0;openFeed(n)}render()});
+  ['filterVenue','filterSide','minTrade'].forEach(id=>$(id).addEventListener('input',render));
+  $('clearOutcomes').addEventListener('click',()=>{outcomes=outcomes.filter(x=>x.asset!==asset);persist();render()});
+  document.addEventListener('visibilitychange',()=>{visible=!document.hidden;if(!visible){pending=null;strength={side:'NONE',since:0,candidate:null,changeAt:0}}else{watchdog();render()}});
+  window.addEventListener('online',()=>{watchdog();render()});
+  window.addEventListener('resize',()=>chart());
+  boot();setInterval(()=>{if(!document.hidden)render()},1000);setInterval(watchdog,7500);
 })();
