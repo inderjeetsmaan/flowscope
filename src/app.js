@@ -185,10 +185,14 @@
     const display=recent.filter(t=>(filterVenue==='ALL'||filterVenue===t.venue)&&(filterSide==='ALL'||filterSide===t.side)&&t.value>=min).slice(-RENDER_LIMIT).reverse();
     $('tapeRows').innerHTML=display.length?display.map(t=>`<tr><td>${displayFull(t.time)}</td><td>${t.venue}<small>${t.quote}</small></td><td class="${t.side==='BUY'?'positive':'negative'}">${t.side}</td><td>${formatNumber(t.price)} <small>${t.quote}</small></td><td>${fmtCompact(t.value)}</td></tr>`).join(''):'<tr><td class="empty" colspan="5">No matching public executions received yet.</td></tr>';
     $('historyRows').innerHTML=assetOutcomes.length?assetOutcomes.slice(-12).reverse().map(x=>`<tr><td>${displayDate(x.timestamp)}</td><td>${x.side}</td><td>${x.result}</td><td>${x.delta==null?'—':(x.delta>=0?'+':'')+x.delta.toFixed(2)+'pp'}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">Waiting for verified non-overlapping observations.</td></tr>';
+    renderFrames(now);
     chart();
   }
   document.querySelectorAll('[data-symbol]').forEach(b=>b.addEventListener('click',()=>{asset=b.dataset.symbol;try{localStorage.setItem(selectedKey,asset)}catch{}boot()}));
-  $('periodSelect').addEventListener('change',e=>{period=Number(e.target.value);strength={side:'NONE',since:0,candidate:null,changeAt:0};render()});
+  for(const id of ['pressureFrame','streakFrame','outlookFrame'])$(id).addEventListener('change',render);
+  $('framePicks').addEventListener('change',e=>{if(!e.target.matches('[data-frame]'))return;const s=Number(e.target.dataset.frame);if(e.target.checked)selectedFrames.add(s);else selectedFrames.delete(s);render()});
+  $('selectAllFrames').addEventListener('click',()=>{selectedFrames=new Set(TIMEFRAMES);render()});
+  $('focusFrames').addEventListener('click',()=>{selectedFrames=new Set([30,300,900]);render()});
   $('reconnect').addEventListener('click',()=>{for(const n of VENUES)if(!feeds[n].unsupported){feeds[n].attempt=0;openFeed(n)}render()});
   ['filterVenue','filterSide','minTrade'].forEach(id=>$(id).addEventListener('input',render));
   $('clearOutcomes').addEventListener('click',()=>{outcomes=outcomes.filter(x=>x.asset!==asset);persist();render()});
