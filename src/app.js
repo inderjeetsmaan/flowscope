@@ -188,6 +188,7 @@
     renderFrames(now);
     chart();
   }
+  document.querySelectorAll('.section-nav a').forEach(a=>a.addEventListener('click',()=>{document.querySelectorAll('.section-nav a').forEach(x=>x.classList.toggle('nav-active',x===a))}));
   document.querySelectorAll('[data-symbol]').forEach(b=>b.addEventListener('click',()=>{asset=b.dataset.symbol;try{localStorage.setItem(selectedKey,asset)}catch{}boot()}));
   for(const id of ['pressureFrame','streakFrame','outlookFrame'])$(id).addEventListener('change',render);
   $('framePicks').addEventListener('change',e=>{if(!e.target.matches('[data-frame]'))return;const s=Number(e.target.dataset.frame);if(e.target.checked)selectedFrames.add(s);else selectedFrames.delete(s);render()});
