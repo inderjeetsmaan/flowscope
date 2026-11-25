@@ -14,6 +14,10 @@ FlowScope is a free, mobile-friendly research terminal for individual, publicly 
 
 *Interface screenshots were captured with no live market connection. They are not simulated market data or historical performance results.*
 
+## Multi-timeframe analysis
+
+Pressure, dominance streak, and 10-second scenario context have independent timeframe selectors. The comparison matrix supports 15s, 30s, 1m, 3m, 5m, 15m, 30m, and 1h. Longer windows require actual elapsed collection time and sufficient venue health; incomplete windows display warmup instead of implying complete historical coverage. The master consensus uses only complete qualified windows and warns when shorter and longer windows disagree. The views are correlated and are **not** independent predictions or financial advice.
+
 ## Highlights
 
 - Public trade feeds from Binance, Coinbase Exchange, Kraken, OKX, Bybit, Gate.io, Bitstamp and Bitget, with status indicators for feeds that are unavailable or not receiving data.

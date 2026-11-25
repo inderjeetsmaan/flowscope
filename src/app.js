@@ -23,6 +23,12 @@
   let strength = { side:'NONE',since:0,candidate:null,changeAt:0 }, momentumSmooth = 50, lastRenderAt = 0;
   let visible = !document.hidden;
   const LIMIT = 30000, STORE_LIMIT = 600, RENDER_LIMIT = 75;
+  const TIMEFRAMES = [15,30,60,180,300,900,1800,3600];
+  let selectedFrames = new Set([15,30,60,300,900]);
+  let frameStreaks = Object.fromEntries(TIMEFRAMES.map(s=>[s,{side:'NONE',since:0,candidate:null}]));
+  let frameCache = null;
+  const durationLabel = s => s>=3600?`${s/3600}h`:s>=60?`${s/60}m`:`${s}s`;
+  const warmupPct = (s,now) => Math.min(100,100*Math.max(0,now-startedAt)/(s*1000));
   const venueStatus = n => feeds[n]?.state || 'OFFLINE';
   try { const raw=JSON.parse(localStorage.getItem(resultsKey)||'[]'); if(Array.isArray(raw)) outcomes=raw.filter(x=>x && x.asset && x.timestamp && x.features).slice(-STORE_LIMIT) } catch {}
   function persist() { try { localStorage.setItem(resultsKey,JSON.stringify(outcomes.slice(-STORE_LIMIT))) }catch{} }
@@ -76,7 +82,7 @@
     socket.onerror=()=>{if(f.ws===socket)reconnect(name,'Socket error')};
     socket.onclose=()=>{if(f.ws===socket)reconnect(name,'Disconnected')};
   }
-  function boot(){epoch++;Object.values(feeds).forEach(closeFeed);feeds={};recent=[];buckets.clear();series=[];total=0;lastTrade=lastReference=null;pending=null;lastForecastStart=0;lastResult=null;startedAt=Date.now();strength={side:'NONE',since:0,candidate:null,changeAt:0};momentumSmooth=50;
+  function boot(){epoch++;Object.values(feeds).forEach(closeFeed);feeds={};recent=[];buckets.clear();series=[];total=0;lastTrade=lastReference=null;pending=null;lastForecastStart=0;lastResult=null;startedAt=Date.now();strength={side:'NONE',since:0,candidate:null,changeAt:0};momentumSmooth=50;frameStreaks=Object.fromEntries(TIMEFRAMES.map(s=>[s,{side:'NONE',since:0,candidate:null}]));
     for(const name of VENUES){const unsupported=asset==='PAXG'&&['Bybit','Bitstamp','Bitget'].includes(name);feeds[name]={adapter:unsupported?null:adapter(name),unsupported,state:unsupported?'NOT ENABLED':'CONNECTING',ws:null,timer:null,attempt:0,error:'',openAt:0,lastPacketAt:0,lastTradeAt:0,prints:0,ids:new Set(),lastQuote:null};}
     for(const name of VENUES)if(!feeds[name].unsupported)openFeed(name);
     document.querySelectorAll('[data-symbol]').forEach(b=>b.classList.toggle('active',b.dataset.symbol===asset));
@@ -140,7 +146,7 @@
   function formatNumber(n){return n.toLocaleString('en-US',{maximumFractionDigits:n<10?5:2})}
   function row(id,value){$(id).textContent=value}
   function render(){const now=Date.now();lastRenderAt=now;
-    for (const second of buckets.keys()) if(second < Math.floor((now-380000)/1000)) buckets.delete(second);const c=calculate(now);analyzeForecast(now,c);
+    for (const second of buckets.keys()) if(second < Math.floor((now-3660000)/1000)) buckets.delete(second);const c=calculate(now);analyzeForecast(now,c);
     const {window:w,last10,last30,last60,q,liveCount}=c,connected=VENUES.filter(n=>feeds[n]?.ws?.readyState===WebSocket.OPEN).length;
     $('statusLed').classList.toggle('active',liveCount>0);row('connectionState',liveCount?`${liveCount} RECEIVING · ${connected} CONNECTED`:connected?`${connected} CONNECTED · WAITING`:'CONNECTING / BLOCKED');
     const freshRef=lastReference&&now-lastReference.receivedAt<10000;
