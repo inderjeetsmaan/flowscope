@@ -8,9 +8,9 @@ FlowScope is a lightweight market-research dashboard for watching public cryptoc
 
 ## Preview
 
-![Desktop overview](docs/screenshots/desktop.png)
+![Desktop overview](docs/screenshots/desktop.jpg)
 
-<p align="center"><img src="docs/screenshots/mobile.png" alt="FlowScope mobile dashboard" width="320"></p>
+<p align="center"><img src="docs/screenshots/mobile.jpg" alt="FlowScope mobile dashboard" width="320"></p>
 
 The screenshots show the interface in a disconnected preview environment. Figures are intentionally empty until a live exchange feed connects. The application never fabricates market trades.
 
@@ -57,8 +57,8 @@ flowscope/
 │   ├── styles.css         # Responsive design and pressure effects
 │   └── app.js             # Exchange streams, aggregation and outlooks
 ├── docs/screenshots/
-│   ├── desktop.png
-│   └── mobile.png
+│   ├── desktop.jpg
+│   └── mobile.jpg
 ├── vercel.json
 ├── .gitignore
 └── README.md
