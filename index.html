@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#081720" />
+  <meta name="description" content="A live multi-exchange crypto trade tape and market-pressure analysis dashboard." />
+  <title>FlowScope | Order Flow Intelligence</title>
+  <link rel="stylesheet" href="src/styles.css" />
+  <script src="src/app.js" defer></script>
+</head>
+<body>
+<main class="shell">
+  <header class="masthead">
+    <div class="identity"><div class="emblem">≋</div><div><strong>FlowScope</strong><small>LIVE ORDER FLOW INTELLIGENCE</small></div></div>
+    <div class="connection-pill"><span id="indicator" class="indicator"></span><span id="connectionText">CONNECTING</span></div>
+  </header>
+  <section class="introduction"><h1>Market pressure, <span>trade by trade.</span></h1><p>Live public executions across exchanges, rolling buy/sell pressure and a measured ten-second outlook.</p></section>
+  <div class="toolbar">
+    <div class="symbols" id="symbols"><button data-symbol="BTC" class="active">BTC</button><button data-symbol="ETH">ETH</button><button data-symbol="SOL">SOL</button><button data-symbol="PAXG">Gold · PAXG</button></div>
+    <div class="toolbar-right"><select id="windowLength" aria-label="Pressure window"><option value="15">15 seconds</option><option value="30">30 seconds</option><option value="60" selected>1 minute</option><option value="300">5 minutes</option></select><button id="reconnect">↻ Reconnect</button></div>
+  </div>
+  <aside class="gold-notice" id="goldNotice" hidden>PAXG tracks tokenized-gold crypto executions, <strong>not</strong> the global OTC XAU/USD market. Do not use it as a direct measure of broker gold order flow.</aside>
+  <div class="metrics">
+    <div class="metric"><label>Last execution</label><strong id="lastPrice">—</strong><small id="lastDetails">Waiting for live trades</small></div>
+    <div class="metric"><label>Buyer-initiated</label><strong class="green" id="buyNotional">—</strong><small id="buyTrades">0 prints</small></div>
+    <div class="metric"><label>Seller-initiated</label><strong class="red" id="sellNotional">—</strong><small id="sellTrades">0 prints</small></div>
+    <div class="metric"><label>Net taker delta</label><strong id="volumeDelta">—</strong><small id="coverageText">No samples</small></div>
+  </div>
+  <div class="columns">
+    <div class="insight-column">
+      <section class="panel">
+        <div class="panel-head"><h2>Market pressure</h2><small id="windowCaption">Rolling 60 seconds</small></div>
+        <div class="panel-content">
+          <div class="pressure-head"><div><label>BUY TAKERS</label><strong class="green" id="buyPercent">—</strong></div><div class="right-align"><label>SELL TAKERS</label><strong class="red" id="sellPercent">—</strong></div></div>
+          <div class="pressure-meter"><span id="buyMeter"></span></div><div class="split-caption"><span>Buyer-initiated value</span><span>Seller-initiated value</span></div>
+          <div class="trend-grid">
+            <article class="trend-card trend-green" id="buyCard" data-strength="0"><label>BUY PRESSURE RISING</label><div class="trend-time green" id="buyTimer">00:00</div><div class="trend-sub" id="buyTimerState">Awaiting confirmation</div><div class="strength-track"><span id="buyStrength"></span></div><small id="buyStrengthName">IDLE</small><div class="outlook"><label>NEXT 10 SECONDS</label><h3 id="buyOutlook">ASSESSING</h3><p id="buyReason">Collecting market observations</p><div class="outlook-meter"><span id="buyLikelihood"></span></div><small id="buyProbability">Not calibrated</small></div></article>
+            <article class="trend-card trend-red" id="sellCard" data-strength="0"><label>SELL PRESSURE RISING</label><div class="trend-time red" id="sellTimer">00:00</div><div class="trend-sub" id="sellTimerState">Awaiting confirmation</div><div class="strength-track"><span id="sellStrength"></span></div><small id="sellStrengthName">IDLE</small><div class="outlook"><label>NEXT 10 SECONDS</label><h3 id="sellOutlook">ASSESSING</h3><p id="sellReason">Collecting market observations</p><div class="outlook-meter"><span id="sellLikelihood"></span></div><small id="sellProbability">Not calibrated</small></div></article>
+          </div>
+          <div class="quality-note" id="qualityNote">Signals require multiple receiving venues and adequate trade counts.</div>
+        </div>
+      </section>
+      <section class="panel"><div class="panel-head"><h2>Forecast verification</h2><small id="verifiedCount">0 checks</small></div><div class="panel-content summary-lines"><div><span>Latest verified result</span><strong id="lastOutcome">—</strong></div><div><span>Observed continuation rate</span><strong id="continuationRate">—</strong></div><div><span>Latest forecast</span><strong id="forecastTimestamp">—</strong></div><p class="quality-note">The next ten seconds are evaluated against subsequent real executions. These statistics describe pressure changes, not future asset-price accuracy.</p></div></section>
+      <section class="panel"><div class="panel-head"><h2>Price trace</h2><small>Last 120 received trades</small></div><div class="panel-content"><svg id="pricePlot" viewBox="0 0 500 130" preserveAspectRatio="none" role="img" aria-label="Observed trade-price trace"><path id="pricePath" d=""></path></svg><p class="placeholder" id="pricePlaceholder">Waiting for trades</p></div></section>
+    </div>
+    <div class="market-column">
+      <section class="panel"><div class="panel-head"><h2>Individual execution tape</h2><small id="totalTrades">0 received</small></div><div class="filters"><select id="venueFilter" aria-label="Filter by venue"><option value="ALL">All exchanges</option><option>Binance</option><option>Coinbase</option><option>Kraken</option><option>OKX</option><option>Bybit</option><option>Gate.io</option><option>Bitstamp</option><option>Bitget</option></select><select id="sideFilter" aria-label="Filter by side"><option value="ALL">Buy + Sell</option><option value="BUY">Buys</option><option value="SELL">Sells</option></select><input type="number" min="0" id="minValue" placeholder="Min USD $" aria-label="Minimum trade value" /></div><div class="table-scroller"><table><thead><tr><th>Time</th><th>Exchange</th><th>Side</th><th>Price</th><th>USD ≈</th></tr></thead><tbody id="tradeRows"><tr><td colspan="5" class="empty">Connecting to public exchanges…</td></tr></tbody></table></div><div class="panel-foot"><span id="bufferCount">0 buffered</span><span>Most recent 80 matching trades</span></div></section>
+      <section class="panel"><div class="panel-head"><h2>Exchange connections</h2><small id="feedCount">Starting</small></div><div class="panel-content" id="exchangeRows"></div></section>
+      <section class="panel"><div class="panel-head"><h2>Historical checks</h2><small id="historyCount">0 outcomes</small></div><div class="table-scroller"><table><thead><tr><th>Time</th><th>Market</th><th>Signal</th><th>Result</th><th>Δ pressure</th></tr></thead><tbody id="historyRows"><tr><td colspan="5" class="empty">No completed ten-second checks yet</td></tr></tbody></table></div><div class="panel-foot"><button id="clearHistory">Clear saved history</button><span>Stored in this browser</span></div></section>
+    </div>
+  </div>
+  <aside class="disclaimer">The forecasts estimate short-term <strong>aggressor-pressure persistence</strong>, not whether price will rise or fall. Estimates are withheld until at least 20 comparable real outcomes are available. Trading costs, liquidity, incomplete venue coverage and network delays can invalidate trading decisions. This website does not place orders or read private accounts.</aside>
+  <footer>Browser-only public WebSocket streams · No API keys · No simulated market data · Mobile browsers may suspend inactive tabs. Source is an experimental market research dashboard.</footer>
+</main></body></html>
