@@ -17,7 +17,7 @@
     if (!Number.isFinite(time) || time < now - 120000 || time > now + 5000) return null;
     if (side !== 'BUY' && side !== 'SELL') return null;
     return { venue: raw.venue, asset: raw.asset, quote: raw.quote, price, quantity, value: price * quantity,
-      side, time, tradeId: raw.tradeId == null ? null : String(raw.tradeId), receivedAt: now };
+      side, time: Math.round(time), tradeId: raw.tradeId == null ? null : String(raw.tradeId), receivedAt: now };
   }
   function summary(trades, start, end) {
     let buy = 0, sell = 0, count = 0, first = null, last = null;
@@ -120,9 +120,38 @@
     const predicted = forecast.side === 'BUY' ? 'BUY_RISING' : 'SELL_RISING';
     return { result: actual === 'FLAT' ? 'FLAT' : actual === predicted ? 'CORRECT' : 'WRONG', delta: change, reason: actual };
   }
+
+  function consensus(rows) {
+    const qualified=rows.filter(x=>x.ready&&Number.isFinite(x.share));
+    const b=qualified.filter(x=>x.direction==='BUY_DOMINANT').length,s=qualified.filter(x=>x.direction==='SELL_DOMINANT').length;
+    const mean=qualified.length?qualified.reduce((a,x)=>a+x.share,0)/qualified.length:null;
+    const opposite=b>0&&s>0;
+    const alignment=qualified.length?100*Math.max(b,s)/qualified.length:null;
+    const coherent=qualified.length>=2&&!opposite&&Math.max(b,s)>=2&&alignment>=70&&(b>s?mean>=57:s>b?mean<=43:false);
+    return {status:qualified.length<2?'WARMUP':opposite?'CONFLICT':coherent?'ALIGNED':'MIXED',share:coherent?mean:null,mean,alignment,buys:b,sells:s,qualified:qualified.length,selected:rows.length,leader:coherent?(b>s?'BUY':'SELL'):'NONE'};
+  }
+  function concentration(summary) {
+    if(!summary?.byVenue||!summary.buy&&!summary.sell)return null;
+    const total=summary.buy+summary.sell;let max=0;
+    for(const v of summary.byVenue.values()) max=Math.max(max,(v.buy||0)+(v.sell||0));
+    return max/total;
+  }
+  function wilson(success,total) {
+    if(total<1)return null;
+    const z=1.96,p=success/total,d=1+z*z/total,c=(p+z*z/(2*total))/d;
+    const radius=z*Math.sqrt(p*(1-p)/total+z*z/(4*total*total))/d;
+    return {rate:100*p,low:100*Math.max(0,c-radius),high:100*Math.min(1,c+radius)};
+  }
+  function benchmark(records,field='flowResult'){
+    const eligible=records.filter(x=>x[field]==='CORRECT'||x[field]==='WRONG');
+    const hits=eligible.filter(x=>x[field]==='CORRECT').length;
+    const base=eligible.filter(x=>x.flowActual==='BUY'||x.flowActual==='SELL');
+    const dominant=base.filter(x=>x.flowActual==='BUY').length>=base.length/2?'BUY':'SELL';
+    return {total:eligible.length,hits,interval:wilson(hits,eligible.length),baseline:base.length?100*base.filter(x=>x.flowActual===dominant).length/base.length:null};
+  }
   function displayTime(time, tz) {
     if (!Number.isFinite(time)) return '—';
     return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(time);
   }
-  return { normalize, summary, summaryBins, compare, direction, qualify, agreement, estimate, rateFor, settle, displayTime, clamp };
+  return { normalize, summary, summaryBins, compare, direction, qualify, agreement, estimate, rateFor, settle, consensus, concentration, wilson, benchmark, displayTime, clamp };
 });

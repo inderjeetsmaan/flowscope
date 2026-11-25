@@ -18,6 +18,14 @@ FlowScope is a free, mobile-friendly research terminal for individual, publicly 
 
 Pressure, dominance streak, and 10-second scenario context have independent timeframe selectors. The comparison matrix supports 15s, 30s, 1m, 3m, 5m, 15m, 30m, and 1h. Longer windows require actual elapsed collection time and sufficient venue health; incomplete windows display warmup instead of implying complete historical coverage. The master consensus uses only complete qualified windows and warns when shorter and longer windows disagree. The views are correlated and are **not** independent predictions or financial advice.
 
+## Current research release
+
+FlowScope separates live USD and USDT market calculations, normalizes execution timestamps, monitors venue freshness and concentration, and provides a multi-timeframe market-pressure console. A conflict-aware BOSS summary abstains when qualified selected windows disagree.
+
+The current research interface includes quote-specific reference prices, venue-level attribution, price-response statistics, 10-second forward flow observations, experimental price-direction labels, empirical confidence intervals, and a majority-direction baseline. Statistics require real future observations and do not establish a profitable strategy. Browser-side data collection may pause in background or sleep.
+
+This repository mirrors the currently deployed Vercel production source. No broker trading functionality or private API credentials are included.
+
 ## Highlights
 
 - Public trade feeds from Binance, Coinbase Exchange, Kraken, OKX, Bybit, Gate.io, Bitstamp and Bitget, with status indicators for feeds that are unavailable or not receiving data.

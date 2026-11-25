@@ -1,204 +1,210 @@
-/* FlowScope: market feeds, honest signal lab, and terminal UI. */
+/* FlowScope terminal: real executed trades, market quality, and forward-only research. */
 (() => {
-  'use strict';
-  const E = window.FlowEngine;
-  if (!E) throw new Error('FlowEngine missing');
-  const $ = (id) => document.getElementById(id);
-  const VENUES = ['Binance', 'Coinbase', 'Kraken', 'OKX', 'Bybit', 'Gate.io', 'Bitstamp', 'Bitget'];
-  const QUOTES = { BTC: ['USDT','USD'], ETH: ['USDT','USD'], SOL: ['USDT','USD'], PAXG: ['USDT','USD'] };
-  const fmtMoney = (n, precision=2) => n === null || !Number.isFinite(n) ? '—' : '$' + Number(n).toLocaleString('en-US',{minimumFractionDigits:precision,maximumFractionDigits:precision});
-  const fmtCompact = n => !Number.isFinite(n) ? '—' : (n >= 1e9 ? '$'+(n/1e9).toFixed(2)+'B' : n>=1e6?'$'+(n/1e6).toFixed(2)+'M':n>=1000?'$'+(n/1000).toFixed(1)+'K':fmtMoney(n));
-  const pct = n => n == null ? '—' : n.toFixed(1) + '%';
-  const msLabel = n => n == null ? '—' : (n>=1000?(n/1000).toFixed(1)+'s':Math.round(n)+'ms');
-  const age = n => n ? Math.max(0,Math.floor((Date.now()-n)/1000))+'s ago' : 'Never';
-  const marketKey = (asset, venue) => (venue==='Coinbase'||venue==='Kraken'||venue==='Bitstamp') ? asset+'/USD':asset+'/USDT';
-  const displayDate = ts => E.displayTime(ts, Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
-  const displayFull = ts => displayDate(ts)+'.'+String(ts%1000).padStart(3,'0');
-  const resultsKey = 'flowscope-v2-verified-forecasts';
-  const selectedKey = 'flowscope-v2-asset';
-  let savedAsset = 'BTC'; try { savedAsset=localStorage.getItem(selectedKey)||'BTC' }catch{}
-  let asset = ['BTC','ETH','SOL','PAXG'].includes(savedAsset) ? savedAsset : 'BTC';
-  let period = 60, epoch = 0, feeds = {}, recent = [], buckets = new Map(), series = [], outcomes = [], pending = null, total = 0;
-  let startedAt = Date.now(), lastTrade = null, lastReference = null, lastForecastStart = 0, lastResult = null;
-  let strength = { side:'NONE',since:0,candidate:null,changeAt:0 }, momentumSmooth = 50, lastRenderAt = 0;
-  let visible = !document.hidden;
-  const LIMIT = 30000, STORE_LIMIT = 600, RENDER_LIMIT = 75;
-  const TIMEFRAMES = [15,30,60,180,300,900,1800,3600];
-  let selectedFrames = new Set([15,30,60,300,900]);
-  let frameStreaks = Object.fromEntries(TIMEFRAMES.map(s=>[s,{side:'NONE',since:0,candidate:null}]));
-  let frameCache = null;
-  const durationLabel = s => s>=3600?`${s/3600}h`:s>=60?`${s/60}m`:`${s}s`;
-  const warmupPct = (s,now) => Math.min(100,100*Math.max(0,now-startedAt)/(s*1000));
-  const venueStatus = n => feeds[n]?.state || 'OFFLINE';
-  try { const raw=JSON.parse(localStorage.getItem(resultsKey)||'[]'); if(Array.isArray(raw)) outcomes=raw.filter(x=>x && x.asset && x.timestamp && x.features).slice(-STORE_LIMIT) } catch {}
-  function persist() { try { localStorage.setItem(resultsKey,JSON.stringify(outcomes.slice(-STORE_LIMIT))) }catch{} }
-  function adapter(name) {
-    const A=asset, pair=A+'USDT', coin=A+'-USD';
-    const put = (side,p,q,time,id) => accept({venue:name,asset:A,quote:marketKey(A,name).split('/')[1],side,price:p,quantity:q,time,tradeId:id});
-    if(name==='Binance') return {url:'wss://data-stream.binance.vision/ws/'+pair.toLowerCase()+'@trade', parse:d=>{if(d.e==='trade')put(d.m?'SELL':'BUY',d.p,d.q,d.T,d.t)}};
-    if(name==='Coinbase') return {url:'wss://ws-feed.exchange.coinbase.com', subscribe:{type:'subscribe',product_ids:[coin],channels:['matches']}, parse:d=>{if(d.type==='match')put(d.side==='buy'?'SELL':'BUY',d.price,d.size,Date.parse(d.time),d.trade_id)}};
-    if(name==='Kraken') return {url:'wss://ws.kraken.com/v2',subscribe:{method:'subscribe',params:{channel:'trade',symbol:[A+'/USD']}},parse:d=>{if(d.channel==='trade'&&Array.isArray(d.data))for(const t of d.data)put(t.side,t.price,t.qty,Date.parse(t.timestamp),t.trade_id)}};
-    if(name==='OKX') return {url:'wss://ws.okx.com:8443/ws/v5/public',subscribe:{op:'subscribe',args:[{channel:'trades',instId:A+'-USDT'}]},parse:d=>{if(d.arg?.channel==='trades'&&Array.isArray(d.data))for(const t of d.data)put(t.side,t.px,t.sz,t.ts,t.tradeId)}};
-    if(name==='Bybit') return {url:'wss://stream.bybit.com/v5/public/spot',subscribe:{op:'subscribe',args:['publicTrade.'+pair]},ping:JSON.stringify({op:'ping'}),parse:d=>{if(d.topic?.startsWith('publicTrade.')&&Array.isArray(d.data))for(const t of d.data)put(t.S,t.p,t.v,t.T,t.i)}};
-    if(name==='Gate.io') return {url:'wss://api.gateio.ws/ws/v4/', subscribe:{time:Math.floor(Date.now()/1000),channel:'spot.trades',event:'subscribe',payload:[A+'_USDT']}, parse:d=>{if(d.channel==='spot.trades'&&d.event==='update'){const items=Array.isArray(d.result)?d.result:[d.result];for(const t of items)if(t)put(t.side,t.price,t.amount,Number(t.create_time_ms)||Number(t.create_time)*1000,t.id)}}};
-    if(name==='Bitstamp') return {url:'wss://ws.bitstamp.net',subscribe:{event:'bts:subscribe',data:{channel:'live_trades_'+A.toLowerCase()+'usd'}},parse:d=>{if(d.event==='trade'&&d.data){const t=d.data;put(Number(t.type)===0?'BUY':Number(t.type)===1?'SELL':'UNKNOWN',t.price,t.amount,t.microtimestamp?Number(t.microtimestamp)/1000:Number(t.timestamp)*1000,t.id)}}};
-    if(name==='Bitget') return {url:'wss://ws.bitget.com/v2/ws/public',subscribe:{op:'subscribe',args:[{instType:'SPOT',channel:'trade',instId:pair}]},ping:'ping',parse:d=>{if(d.arg?.channel==='trade'&&Array.isArray(d.data))for(const t of d.data){if(Array.isArray(t))put(t[3],t[1],t[2],t[0],t[4]);else put(t.side,t.price||t.p,t.size||t.sz,t.ts,t.tradeId||t.id)}}};
-    return null;
-  }
-  function accept(raw) {
-    const trade=E.normalize(raw),f=feeds[raw.venue];
-    if(!trade||!f)return;
-    const key=trade.tradeId && raw.venue+':'+asset+':'+trade.tradeId;
-    if(key){if(f.ids.has(key))return;f.ids.add(key);if(f.ids.size>14000)f.ids.clear()}
-    recent.push(trade);
-    const sec = Math.floor(trade.time / 1000);
-    let bucket = buckets.get(sec);
-    if(!bucket){bucket={buy:0,sell:0,count:0,byVenue:new Map()};buckets.set(sec,bucket)}
-    bucket[trade.side==='BUY'?'buy':'sell']+=trade.value;
-    bucket.count++;
-    const vb=bucket.byVenue.get(trade.venue)||{buy:0,sell:0,count:0};
-    vb[trade.side==='BUY'?'buy':'sell']+=trade.value;vb.count++;bucket.byVenue.set(trade.venue,vb);
-    total++;f.prints++;f.lastTradeAt=Date.now();f.lastPacketAt=Date.now();f.state='RECEIVING';f.lastQuote=trade;
-    lastTrade=trade;
-    if(trade.venue==='Binance') {
-      lastReference=trade;series.push({t:trade.time,p:trade.price});
-      if(series.length>4000)series.splice(0,series.length-4000);
-    }
-    if(recent.length>LIMIT)recent.splice(0,recent.length-LIMIT);
-  }
-  function closeFeed(f) {
-    if(f.timer)clearTimeout(f.timer);f.timer=null;
-    if(f.ws){const s=f.ws;f.ws=null;s.onclose=s.onopen=s.onerror=s.onmessage=null;try{s.close()}catch{}}
-  }
-  function reconnect(name,why){const f=feeds[name];if(!f||f.unsupported)return;closeFeed(f);f.state='RETRYING';f.error=why;f.attempt++;f.timer=setTimeout(()=>{f.timer=null;openFeed(name)},Math.min(35000,1250*2**Math.min(f.attempt,5))+Math.random()*500)}
-  function openFeed(name){const f=feeds[name];if(!f||f.unsupported)return;closeFeed(f);f.state='CONNECTING';f.openAt=Date.now();f.lastPacketAt=Date.now();const generation=epoch;let socket;try{socket=new WebSocket(f.adapter.url)}catch{return reconnect(name,'WebSocket blocked')}
-    f.ws=socket;
-    socket.onopen=()=>{if(generation!==epoch||f.ws!==socket)return;f.state='CONNECTED';f.attempt=0;f.lastPacketAt=Date.now();try{if(f.adapter.subscribe)socket.send(JSON.stringify(f.adapter.subscribe))}catch{reconnect(name,'Subscription failed')}};
-    socket.onmessage=e=>{if(generation!==epoch||f.ws!==socket)return;f.lastPacketAt=Date.now();try{
-      const d=JSON.parse(e.data);
-      if(d.event==='error'||d.success===false||(d.code&&d.msg&&String(d.code)!=='0')){reconnect(name,'Exchange rejected subscription');return}
-      f.adapter.parse(d);
-    }catch(err){f.error='Unrecognized message'}};
-    socket.onerror=()=>{if(f.ws===socket)reconnect(name,'Socket error')};
-    socket.onclose=()=>{if(f.ws===socket)reconnect(name,'Disconnected')};
-  }
-  function boot(){epoch++;Object.values(feeds).forEach(closeFeed);feeds={};recent=[];buckets.clear();series=[];total=0;lastTrade=lastReference=null;pending=null;lastForecastStart=0;lastResult=null;startedAt=Date.now();strength={side:'NONE',since:0,candidate:null,changeAt:0};momentumSmooth=50;frameStreaks=Object.fromEntries(TIMEFRAMES.map(s=>[s,{side:'NONE',since:0,candidate:null}]));
-    for(const name of VENUES){const unsupported=asset==='PAXG'&&['Bybit','Bitstamp','Bitget'].includes(name);feeds[name]={adapter:unsupported?null:adapter(name),unsupported,state:unsupported?'NOT ENABLED':'CONNECTING',ws:null,timer:null,attempt:0,error:'',openAt:0,lastPacketAt:0,lastTradeAt:0,prints:0,ids:new Set(),lastQuote:null};}
-    for(const name of VENUES)if(!feeds[name].unsupported)openFeed(name);
-    document.querySelectorAll('[data-symbol]').forEach(b=>b.classList.toggle('active',b.dataset.symbol===asset));
-    $('noticeGold').hidden=asset!=='PAXG';$('symbolCode').textContent=asset+'/USDT · Binance spot reference';render();
-  }
-  function watchdog(){if(document.hidden)return;const now=Date.now();for(const n of VENUES){const f=feeds[n];if(f.unsupported)continue;
-    if(f.ws?.readyState===WebSocket.CONNECTING&&now-f.openAt>16000)reconnect(n,'Handshake timeout');
-    else if(f.ws?.readyState===WebSocket.OPEN&&now-f.lastPacketAt>80000)reconnect(n,'No packets');
-    else if(!f.ws&&!f.timer)reconnect(n,'Socket absent');
-    else if(f.ws?.readyState===WebSocket.OPEN&&f.adapter.ping&&now-f.lastPacketAt>18000){try{f.ws.send(f.adapter.ping)}catch{reconnect(n,'Ping failed')}}
-  }}
-  function setStreak(candidate,now,valid){
-    if(!valid||candidate==='NONE') {strength={side:'NONE',since:0,candidate:null,changeAt:0};return}
-    if(strength.side===candidate){strength.candidate=null;return}
-    if(strength.candidate?.side!==candidate){strength.candidate={side:candidate,at:now};return}
-    if(now-strength.candidate.at>=3000){strength={side:candidate,since:strength.candidate.at,candidate:null,changeAt:now}}
-  }
-  function streakUI(side){const on=strength.side===side,ts=on?Math.floor((Date.now()-strength.since)/1000):0,id=side==='BUY'?'buy':'sell',level=ts>=180?4:ts>=60?3:ts>=25?2:ts>0?1:0;
-    $(id+'Streak').textContent=on?String(Math.floor(ts/60)).padStart(2,'0')+':'+String(ts%60).padStart(2,'0'):'00:00';
-    $(id+'Strength').textContent=['IDLE','BUILDING','DEVELOPING','SUSTAINED','EXTENDED'][level];
-    $(id+'Meter').style.width=Math.min(100,ts/180*100)+'%';
-    $(id+'Tile').dataset.level=level;
-    $(id+'StreakDetail').textContent=on?'Dominant direction held across confirmed updates':'No qualifying dominance streak';
-  }
-  const lagMs=()=>lastTrade?Date.now()-lastTrade.receivedAt:Infinity;
-  function calculate(now){const end=Math.floor(now/1000)*1000;const last30=E.summaryBins(buckets,end-30000,end),prev10=E.summaryBins(buckets,end-20000,end-10000),last10=E.summaryBins(buckets,end-10000,end),last60=E.summaryBins(buckets,end-60000,end),window=E.summaryBins(buckets,end-period*1000,end);
-    const liveCount=VENUES.filter(n=>feeds[n]?.lastTradeAt&&now-feeds[n].lastTradeAt<15000).length;
-    const q=E.qualify(window,lagMs(),now-startedAt,{minTrades:40,minVenues:2,minAge:10000});
-    if(liveCount<2)q.reasons.push('VENUE_FEEDS_STALE');q.ok=q.reasons.length===0;
-    return {last30,prev10,last10,last60,window,liveCount,q};
-  }
-  function analyzeForecast(now,c){
-    if(document.hidden){pending=null;return}
-    // A forecast is issued at most once per ten seconds. The target observation is *only* the subsequent ten seconds.
-    if(pending&&now>=pending.until+500){
-      const forward=E.summaryBins(buckets,pending.at,pending.until),result=E.settle(pending,forward,{minForward:20,minVenues:2});
-      if(now-pending.until>4500)result.result='INVALID';
-      const row={timestamp:pending.issuedAt,asset,side:pending.side,baseline:pending.baseline,features:pending.features,result:result.result,delta:result.delta,reason:result.reason};
-      outcomes.push(row);outcomes=outcomes.slice(-STORE_LIMIT);lastResult=row;persist();pending=null;
-    }
-    if(pending||!c.q.ok||Date.now()-startedAt<30000)return;
-    if(now-lastForecastStart<10000)return;
-    lastForecastStart=now;
-    const end=Math.floor(now/1000)*1000;
-    const short=E.summaryBins(buckets,end-10000,end),earlier=E.summaryBins(buckets,end-20000,end-10000),main=E.summaryBins(buckets,end-60000,end);
-    const strict=E.qualify(short,lagMs(),now-startedAt,{minTrades:30,minVenues:2,minAge:30000});
-    const decision=E.estimate(short,earlier,main,strict);
-    if(decision.side==='ABSTAIN')return;
-    const futureStart=end+1000; // Skip incomplete current second: no pre-issuance prints leak into target.
-    pending={issuedAt:now,at:futureStart,until:futureStart+10000,asset,side:decision.side,baseline:short.buyPercent,features:decision.features,reason:decision.reason};
-  }
-  function chart(){const canvas=$('priceCanvas');if(!canvas)return;const context=canvas.getContext('2d');if(!context)return;const r=canvas.getBoundingClientRect();const dpr=Math.min(2,window.devicePixelRatio||1),w=Math.max(240,r.width),h=Math.max(130,r.height);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
-    let points=series.filter(x=>x.t>=Date.now()-180000).slice(-700);
-    if(points.length<2){context.fillStyle='#94adb7';context.font='12px sans-serif';context.fillText('Waiting for Binance spot executions…',18,h/2);return}
-    let lo=Math.min(...points.map(x=>x.p)),hi=Math.max(...points.map(x=>x.p));const pad=(hi-lo)*.12||hi*.0002;lo-=pad;hi+=pad;const start=points[0].t,end=points[points.length-1].t;
-    context.strokeStyle='#274451';context.lineWidth=1;for(let i=0;i<5;i++){let y=16+(h-34)*i/4;context.beginPath();context.moveTo(0,y);context.lineTo(w,y);context.stroke()}
-    context.beginPath();points.forEach((p,i)=>{let x=12+(w-24)*(p.t-start)/Math.max(end-start,1),y=14+(h-34)*(1-(p.p-lo)/(hi-lo));if(i===0)context.moveTo(x,y);else context.lineTo(x,y)});context.strokeStyle=points[points.length-1].p>=points[0].p?'#39dcaa':'#fb718d';context.lineWidth=2;context.stroke();
-    context.fillStyle='#b4c9d0';context.font='11px sans-serif';context.fillText('BINANCE '+asset+'/USDT · LAST '+points.length+' PRINTS',12,13);
-    context.fillText(formatNumber(hi),12,h-4);context.textAlign='right';context.fillText(formatNumber(lo),w-12,h-4);context.textAlign='left';
-  }
-  function formatNumber(n){return n.toLocaleString('en-US',{maximumFractionDigits:n<10?5:2})}
-  function row(id,value){$(id).textContent=value}
-  function render(){const now=Date.now();lastRenderAt=now;
-    for (const second of buckets.keys()) if(second < Math.floor((now-3660000)/1000)) buckets.delete(second);const c=calculate(now);analyzeForecast(now,c);
-    const {window:w,last10,last30,last60,q,liveCount}=c,connected=VENUES.filter(n=>feeds[n]?.ws?.readyState===WebSocket.OPEN).length;
-    $('statusLed').classList.toggle('active',liveCount>0);row('connectionState',liveCount?`${liveCount} RECEIVING · ${connected} CONNECTED`:connected?`${connected} CONNECTED · WAITING`:'CONNECTING / BLOCKED');
-    const freshRef=lastReference&&now-lastReference.receivedAt<10000;
-    row('referencePrice',freshRef?formatNumber(lastReference.price)+' USDT':'—');
-    row('referenceAge',freshRef?`Binance BTC/USDT`.replace('BTC',asset)+` · trade ${displayFull(lastReference.time)} · ${age(lastReference.receivedAt)}`:'Reference feed unavailable or stale');
-    row('referenceLatency',freshRef?msLabel(Math.max(0,lastReference.receivedAt-lastReference.time)):'—');
-    row('lastVenue',lastTrade?`${lastTrade.venue} ${lastTrade.asset}/${lastTrade.quote} · ${displayFull(lastTrade.time)}`:'No verified trades received');
-    row('buyNotional',fmtCompact(w.buy));row('sellNotional',fmtCompact(w.sell));row('buyPercent',pct(w.buyPercent));row('sellPercent',w.buyPercent==null?'—':pct(100-w.buyPercent));row('netDelta',w.count?(w.buy>=w.sell?'+':'−')+fmtCompact(Math.abs(w.buy-w.sell)):'—');
-    $('netDelta').className=w.buy>=w.sell?'positive':'negative';
-    $('pressureBar').classList.toggle('empty',w.buyPercent==null);$('pressureFill').style.width=(w.buyPercent??0)+'%';
-    row('sampleInfo',`${w.count.toLocaleString()} executions / ${w.venueCount} venues · ${period}s`);
-    row('referenceLabel',asset+'/USDT · Binance reference (not a consolidated price)');
-    const dominant=E.direction(w.buyPercent,55,2);const strict=q.ok&&(dominant==='BUY_DOMINANT'||dominant==='SELL_DOMINANT');
-    const nextCandidate=strict?(dominant==='BUY_DOMINANT'?'BUY':'SELL'):'NONE';setStreak(nextCandidate,now,q.ok);streakUI('BUY');streakUI('SELL');
-    row('dominance',!q.ok?'UNCONFIRMED':dominant.replace('_',' '));$('dominance').className=dominant==='BUY_DOMINANT'?'positive':dominant==='SELL_DOMINANT'?'negative':'neutral';
-    row('momentum',last10.buyPercent==null||c.prev10.buyPercent==null?'—':(last10.buyPercent-c.prev10.buyPercent>=0?'+':'')+(last10.buyPercent-c.prev10.buyPercent).toFixed(1)+'pp');
-    row('trendExplanation',!q.ok?'Need more fresh trades from at least two venues.':dominant==='BUY_DOMINANT'?'Buy-side notional dominates the selected window.':dominant==='SELL_DOMINANT'?'Sell-side notional dominates the selected window.':'Neither side dominates beyond the noise band.');
-    row('quality',q.ok?'LIVE SAMPLE · not a price signal':`QUALITY HOLD · ${q.reasons.join(' · ')||'waiting'}`);
-    row('trend30',pct(last30.buyPercent));row('trend60',pct(last60.buyPercent));
-    const d= pending ? {side:pending.side,reason:pending.reason,features:pending.features} : {side:'ABSTAIN',reason:q.ok?'No qualifying, non-overlapping 10-second forecast right now.':'Not enough live coverage.'};
-    row('forecastDirection',pending?(d.side==='BUY'?'BUY PRESSURE ↑':'SELL PRESSURE ↑'):'WAIT / NO EDGE');
-    $('forecastDirection').className=pending?(d.side==='BUY'?'positive':'negative'):'neutral';
-    row('forecastReason',d.reason);row('forecastCountdown',pending?Math.max(0,Math.ceil((pending.until-now)/1000))+'s to outcome':'—');
-    const assetOutcomes=outcomes.filter(x=>x.asset===asset),valid=assetOutcomes.filter(x=>x.result==='CORRECT'||x.result==='WRONG'),wins=valid.filter(x=>x.result==='CORRECT').length;
-    const matched= pending?E.rateFor(assetOutcomes,pending.features):{count:0,rate:null};
-    row('empiricalRate',pending?(matched.rate==null?`UNVERIFIED · ${matched.count}/30 comparable`:matched.rate.toFixed(1)+'% observed continuation · '+matched.count+' checks'):'Awaiting validated forecast');
-    row('forecastTrack',pending?'OPEN · 10s forward window':'—');
-    row('forecastStatus',valid.length>=30?`${(100*wins/valid.length).toFixed(1)}% directional hits · ${valid.length} checks`:`${valid.length}/30 directional outcomes · unvalidated`);
-    row('lastOutcome',lastResult?`${lastResult.side}: ${lastResult.result}`:'No completed forecast yet');
-    row('outcomeDetails',lastResult?`${lastResult.delta==null?'—':(lastResult.delta>=0?'+':'')+lastResult.delta.toFixed(2)+'pp'} · ${displayDate(lastResult.timestamp)}`:'Forecasts require a complete, observed next 10s');
-    row('observations',outcomes.filter(x=>x.asset===asset).length.toLocaleString()+' recorded outcomes');
-    row('totalReceived',total.toLocaleString()+' received');row('bufferSize',recent.length.toLocaleString()+' retained; latest '+RENDER_LIMIT+' displayed');
-    row('timezone',Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC');
-    $('venueRows').innerHTML=VENUES.map(n=>{const f=feeds[n],fresh=f.lastTradeAt&&now-f.lastTradeAt<15000;const label=f.unsupported?'NOT ENABLED':fresh?'RECEIVING':f.state==='RECEIVING'?'QUIET / STALE':f.state;return `<div class="venue-row"><span><i class="led-small ${fresh?'good':f.unsupported?'bad':''}"></i><b>${n}</b><small>${asset}/${marketKey(asset,n).split('/')[1]}</small></span><span class="venue-right">${label}<small>${f.prints.toLocaleString()} prints · ${age(f.lastTradeAt)}</small></span></div>`}).join('');
-    const filterVenue=$('filterVenue').value,filterSide=$('filterSide').value,min=Number($('minTrade').value)||0;
-    const display=recent.filter(t=>(filterVenue==='ALL'||filterVenue===t.venue)&&(filterSide==='ALL'||filterSide===t.side)&&t.value>=min).slice(-RENDER_LIMIT).reverse();
-    $('tapeRows').innerHTML=display.length?display.map(t=>`<tr><td>${displayFull(t.time)}</td><td>${t.venue}<small>${t.quote}</small></td><td class="${t.side==='BUY'?'positive':'negative'}">${t.side}</td><td>${formatNumber(t.price)} <small>${t.quote}</small></td><td>${fmtCompact(t.value)}</td></tr>`).join(''):'<tr><td class="empty" colspan="5">No matching public executions received yet.</td></tr>';
-    $('historyRows').innerHTML=assetOutcomes.length?assetOutcomes.slice(-12).reverse().map(x=>`<tr><td>${displayDate(x.timestamp)}</td><td>${x.side}</td><td>${x.result}</td><td>${x.delta==null?'—':(x.delta>=0?'+':'')+x.delta.toFixed(2)+'pp'}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">Waiting for verified non-overlapping observations.</td></tr>';
-    renderFrames(now);
-    chart();
-  }
-  document.querySelectorAll('.section-nav a').forEach(a=>a.addEventListener('click',()=>{document.querySelectorAll('.section-nav a').forEach(x=>x.classList.toggle('nav-active',x===a))}));
-  document.querySelectorAll('[data-symbol]').forEach(b=>b.addEventListener('click',()=>{asset=b.dataset.symbol;try{localStorage.setItem(selectedKey,asset)}catch{}boot()}));
-  for(const id of ['pressureFrame','streakFrame','outlookFrame'])$(id).addEventListener('change',render);
-  $('framePicks').addEventListener('change',e=>{if(!e.target.matches('[data-frame]'))return;const s=Number(e.target.dataset.frame);if(e.target.checked)selectedFrames.add(s);else selectedFrames.delete(s);render()});
-  $('selectAllFrames').addEventListener('click',()=>{selectedFrames=new Set(TIMEFRAMES);render()});
-  $('focusFrames').addEventListener('click',()=>{selectedFrames=new Set([30,300,900]);render()});
-  $('reconnect').addEventListener('click',()=>{for(const n of VENUES)if(!feeds[n].unsupported){feeds[n].attempt=0;openFeed(n)}render()});
-  ['filterVenue','filterSide','minTrade'].forEach(id=>$(id).addEventListener('input',render));
-  $('clearOutcomes').addEventListener('click',()=>{outcomes=outcomes.filter(x=>x.asset!==asset);persist();render()});
-  document.addEventListener('visibilitychange',()=>{visible=!document.hidden;if(!visible){pending=null;strength={side:'NONE',since:0,candidate:null,changeAt:0}}else{watchdog();render()}});
-  window.addEventListener('online',()=>{watchdog();render()});
-  window.addEventListener('resize',()=>chart());
-  boot();setInterval(()=>{if(!document.hidden)render()},1000);setInterval(watchdog,7500);
+'use strict';
+const E=window.FlowEngine;
+if(!E)throw Error('FlowEngine unavailable');
+const $=id=>document.getElementById(id);
+const VENUES=['Binance','Coinbase','Kraken','OKX','Bybit','Gate.io','Bitstamp','Bitget'];
+const FRAMES=[15,30,60,180,300,900,1800,3600],frameName=s=>s===3600?'1h':s>=60?s/60+'m':s+'s';
+const marketQuote=n=>['Coinbase','Kraken','Bitstamp'].includes(n)?'USD':'USDT';
+const money=n=>n==null||!Number.isFinite(n)?'—':n>=1e6?'$'+(n/1e6).toFixed(2)+'M':n>=1000?'$'+(n/1e3).toFixed(1)+'K':'$'+n.toFixed(2);
+const percent=n=>n==null||!Number.isFinite(n)?'—':n.toFixed(1)+'%';
+const fmtPrice=n=>n==null||!Number.isFinite(n)?'—':n.toLocaleString('en-US',{maximumFractionDigits:n<10?5:2});
+const fmtLocal=t=>{const n=Math.round(t);return new Date(n).toLocaleTimeString('en-GB',{hour12:false})+'.'+String(((n%1000)+1000)%1000).padStart(3,'0')};
+const set=(id,value)=>{const el=$(id);if(el)el.textContent=value};
+const key='flowscope-research-v3',selectedKey='flowscope-asset-v3';
+let asset='BTC';try{asset=localStorage.getItem(selectedKey)||'BTC'}catch{}if(!['BTC','ETH','SOL','PAXG'].includes(asset))asset='BTC';
+let quote='USDT',feeds={},epoch=0,raw=[],series={USDT:[],USD:[]},buckets={USD:new Map(),USDT:new Map()},total=0,openedAt=Date.now(),lastPrint=null,references={USD:null,USDT:null},results=[],pending=null,lastIssued=0,lastResult=null;
+let selected=new Set([15,30,60]),frameStreaks=Object.fromEntries(FRAMES.map(s=>[s,{side:'NONE',candidate:0,since:0}]));
+let quoteEpoch=Date.now(),lastTape=0,lastChart=0,displayVersion=0,forecastVersion=1,lastResize=0;
+try{const x=JSON.parse(localStorage.getItem(key)||'[]');if(Array.isArray(x))results=x.filter(v=>v&&v.version===forecastVersion).slice(-1200)}catch{}
+function save(){try{localStorage.setItem(key,JSON.stringify(results.slice(-1200)))}catch{}}
+function correctTime(t){const v=Number(t);if(!Number.isFinite(v))return NaN;return Math.round(v)}
+function parseVenue(name,d){
+ const a=asset,pair=a+'USDT',out=[];
+ const push=(side,p,q,time,id)=>out.push({venue:name,asset:a,quote:marketQuote(name),side:String(side).toUpperCase(),price:p,quantity:q,time:correctTime(time),tradeId:id});
+ if(name==='Binance'&&d.e==='trade')push(d.m?'SELL':'BUY',d.p,d.q,d.T,d.t);
+ if(name==='Coinbase'&&d.type==='match')push(d.side==='buy'?'SELL':'BUY',d.price,d.size,Date.parse(d.time),d.trade_id);
+ if(name==='Kraken'&&d.channel==='trade'&&Array.isArray(d.data))for(const x of d.data)push(x.side,x.price,x.qty,Date.parse(x.timestamp),x.trade_id);
+ if(name==='OKX'&&d.arg?.channel==='trades'&&Array.isArray(d.data))for(const x of d.data)push(x.side,x.px,x.sz,x.ts,x.tradeId);
+ if(name==='Bybit'&&d.topic?.startsWith('publicTrade.')&&Array.isArray(d.data))for(const x of d.data)push(x.S,x.p,x.v,x.T,x.i);
+ if(name==='Gate.io'&&d.channel==='spot.trades'&&d.event==='update'){const rows=Array.isArray(d.result)?d.result:[d.result];for(const x of rows)if(x)push(x.side,x.price,x.amount,x.create_time_ms||Number(x.create_time)*1000,x.id)}
+ if(name==='Bitstamp'&&d.event==='trade'&&d.data){const x=d.data;push(Number(x.type)===0?'BUY':Number(x.type)===1?'SELL':'INVALID',x.price,x.amount,x.microtimestamp?Number(x.microtimestamp)/1000:Number(x.timestamp)*1000,x.id)}
+ if(name==='Bitget'&&d.arg?.channel==='trade'&&Array.isArray(d.data))for(const x of d.data){if(Array.isArray(x))push(x[3],x[1],x[2],x[0],x[4]);else push(x.side,x.price??x.p,x.size??x.sz,x.ts,x.tradeId??x.id)}
+ return out;
+}
+function config(name){
+ const a=asset,b=a+'USDT';
+ const shared={Binance:{url:'wss://data-stream.binance.vision/ws/'+b.toLowerCase()+'@trade'},
+ Coinbase:{url:'wss://ws-feed.exchange.coinbase.com',sub:{type:'subscribe',product_ids:[a+'-USD'],channels:['matches']}},
+ Kraken:{url:'wss://ws.kraken.com/v2',sub:{method:'subscribe',params:{channel:'trade',symbol:[a+'/USD']}}},
+ OKX:{url:'wss://ws.okx.com:8443/ws/v5/public',sub:{op:'subscribe',args:[{channel:'trades',instId:a+'-USDT'}]}},
+ Bybit:{url:'wss://stream.bybit.com/v5/public/spot',sub:{op:'subscribe',args:['publicTrade.'+b]},ping:'{"op":"ping"}'},
+ 'Gate.io':{url:'wss://api.gateio.ws/ws/v4/',sub:{time:Math.floor(Date.now()/1000),channel:'spot.trades',event:'subscribe',payload:[a+'_USDT']}},
+ Bitstamp:{url:'wss://ws.bitstamp.net',sub:{event:'bts:subscribe',data:{channel:'live_trades_'+a.toLowerCase()+'usd'}}},
+ Bitget:{url:'wss://ws.bitget.com/v2/ws/public',sub:{op:'subscribe',args:[{instType:'SPOT',channel:'trade',instId:b}]},ping:'ping'}};
+ return shared[name];
+}
+function put(rawTrade){
+ const t=E.normalize(rawTrade),f=feeds[rawTrade.venue];if(!t||!f)return;
+ const id=t.tradeId?rawTrade.venue+'/'+asset+'/'+t.tradeId:null;
+ if(id){if(f.ids.has(id))return;f.ids.add(id);if(f.ids.size>16000)f.ids.clear()}
+ raw.push(t);if(raw.length>30000)raw.splice(0,raw.length-30000);
+ const sec=Math.floor(t.time/1000),store=buckets[t.quote];let b=store.get(sec);
+ if(!b){b={buy:0,sell:0,count:0,byVenue:new Map()};store.set(sec,b)}
+ b[t.side==='BUY'?'buy':'sell']+=t.value;b.count++;
+ const v=b.byVenue.get(t.venue)||{buy:0,sell:0,count:0};v[t.side==='BUY'?'buy':'sell']+=t.value;v.count++;b.byVenue.set(t.venue,v);
+ total++;f.count++;f.lastTrade=Date.now();f.lastPacket=Date.now();f.status='RECEIVING';
+ if(!lastPrint||t.time>=lastPrint.time)lastPrint=t;
+ const refVenue=t.quote==='USDT'?'Binance':'Coinbase';
+ if(t.venue===refVenue){if(!references[t.quote]||t.time>=references[t.quote].time)references[t.quote]=t;
+ const list=series[t.quote];list.push({t:t.time,p:t.price,received:t.receivedAt});if(list.length>6000)list.splice(0,1000)}
+}
+function close(f){if(!f)return;clearTimeout(f.timer);f.timer=null;if(f.ws){const s=f.ws;f.ws=null;s.onopen=s.onmessage=s.onclose=s.onerror=null;try{s.close()}catch{}}}
+function retry(n,reason){const f=feeds[n];if(!f||f.disabled)return;close(f);f.status='RETRYING';f.error=reason;f.retries++;const delay=Math.min(45000,1000*2**Math.min(f.retries,5))+Math.random()*500;f.timer=setTimeout(()=>{f.timer=null;connect(n)},delay)}
+function connect(n){const f=feeds[n];if(!f||f.disabled)return;close(f);f.status='CONNECTING';f.since=Date.now();f.lastPacket=f.since;const gen=epoch;try{const s=new WebSocket(f.config.url);f.ws=s;s.onopen=()=>{if(gen!==epoch||f.ws!==s)return;f.status='CONNECTED';f.retries=0;f.lastPacket=Date.now();try{if(f.config.sub)s.send(JSON.stringify(f.config.sub))}catch{retry(n,'SUBSCRIBE_FAILED')}};s.onmessage=e=>{if(gen!==epoch||f.ws!==s)return;f.lastPacket=Date.now();try{const d=JSON.parse(e.data);if(d.event==='error'||d.success===false||(d.code&&String(d.code)!=='0'&&d.msg)){retry(n,'SUBSCRIPTION_REJECTED');return}for(const t of parseVenue(n,d))put(t)}catch(err){f.error='PARSER_ERROR'}};s.onerror=()=>{if(f.ws===s)retry(n,'SOCKET_ERROR')};s.onclose=()=>{if(f.ws===s)retry(n,'CLOSED')}}catch{retry(n,'BLOCKED')}}
+function watchdog(){if(document.hidden)return;const now=Date.now();for(const n of VENUES){const f=feeds[n];if(f.disabled)continue;if(f.ws?.readyState===WebSocket.CONNECTING&&now-f.since>18000)retry(n,'CONNECT_TIMEOUT');else if(f.ws?.readyState===WebSocket.OPEN&&now-f.lastPacket>85000)retry(n,'IDLE_TIMEOUT');else if(!f.ws&&!f.timer)retry(n,'DISCONNECTED');else if(f.ws?.readyState===WebSocket.OPEN&&f.config.ping&&now-f.lastPacket>18000){try{f.ws.send(f.config.ping)}catch{retry(n,'PING_ERROR')}}}}
+function resetMarket(){epoch++;Object.values(feeds).forEach(close);buckets={USD:new Map(),USDT:new Map()};raw=[];series={USD:[],USDT:[]};references={USD:null,USDT:null};total=0;openedAt=Date.now();quoteEpoch=openedAt;lastPrint=null;pending=null;lastIssued=0;frameStreaks=Object.fromEntries(FRAMES.map(s=>[s,{side:'NONE',candidate:0,since:0}]));feeds={};for(const n of VENUES){const disabled=asset==='PAXG'&&['Bybit','Bitstamp','Bitget'].includes(n);feeds[n]={config:config(n),disabled,status:disabled?'UNSUPPORTED':'CONNECTING',ws:null,timer:null,retries:0,count:0,lastTrade:0,lastPacket:0,since:0,error:'',ids:new Set()};if(!disabled)connect(n)}document.querySelectorAll('[data-symbol]').forEach(b=>b.classList.toggle('active',b.dataset.symbol===asset));$('noticeGold').hidden=asset!=='PAXG';render()}
+function summarize(sec,now=Date.now()){const end=Math.floor(now/1000)*1000;return E.summaryBins(buckets[quote],end-sec*1000,end)}
+function freshVenues(now=Date.now()){return VENUES.filter(n=>marketQuote(n)===quote&&feeds[n]?.lastTrade&&now-feeds[n].lastTrade<15000)}
+function windowData(sec,now){const w=summarize(sec,now),complete=now-quoteEpoch>=sec*1000+1000,alive=freshVenues(now);const check=E.qualify(w,alive.length?Math.min(...alive.map(n=>now-feeds[n].lastTrade)):Infinity,now-quoteEpoch,{minTrades:30,minVenues:2,minAge:10000});const concentration=E.concentration(w);const ready=complete&&alive.length>=2&&check.ok&&concentration!==null&&concentration<=.92;return {w,complete,ready,concentration,progress:Math.min(100,Math.floor(100*(now-quoteEpoch)/(sec*1000))),status:!complete?'WARMUP':alive.length<2?'INSUFFICIENT FEEDS':concentration>.92?'VENUE CONCENTRATION':ready?'QUALIFIED':'LOW SAMPLE'} }
+function referenceAt(t){const a=series[quote].filter(x=>x.t<=t&&x.t>=t-3500).sort((a,b)=>b.t-a.t);return a[0]||null}
+function labels(issued,until){const older=series[quote].filter(x=>x.t<=issued&&x.t>=issued-4500).sort((a,b)=>b.t-a.t)[0],later=series[quote].filter(x=>x.t>=until-1500&&x.t<=until+1500).sort((a,b)=>Math.abs(a.t-until)-Math.abs(b.t-until))[0];if(!older||!later)return {returnPct:null,side:'INVALID'};const change=100*(later.p/older.p-1);return {returnPct:change,side:change>.015?'BUY':change<-.015?'SELL':'FLAT'} }
+function research(now){
+ // One forecast covers one 10s future interval; never score missing or late data as success.
+ if(document.hidden){pending=null;return}
+ const end=Math.floor(now/1000)*1000;
+ if(pending&&now>=pending.until+1200){const f=pending;pending=null;const future=E.summaryBins(buckets[f.quote],f.start,f.until);
+   const quality=E.qualify(future,0,30000,{minTrades:20,minVenues:2,minAge:10000});
+   const actual=future.buyPercent==null?'INVALID':future.buyPercent-f.baseline>2?'BUY':future.buyPercent-f.baseline< -2?'SELL':'FLAT';
+   const flowResult=!quality.ok||now-f.until>5000?'INVALID':actual==='FLAT'?'FLAT':actual===f.side?'CORRECT':'WRONG';
+   const price=labels(f.issuedAt,f.until),priceResult=price.side==='INVALID'?'INVALID':price.side==='FLAT'?'FLAT':price.side===f.side?'CORRECT':'WRONG';
+   const record={version:forecastVersion,asset:f.asset,quote:f.quote,issuedAt:f.issuedAt,side:f.side,baseline:f.baseline,flowActual:actual,flowDelta:future.buyPercent==null?null:future.buyPercent-f.baseline,flowResult,priceResult,returnPct:price.returnPct,features:f.features};
+   results.push(record);if(results.length>1200)results=results.slice(-1200);lastResult=record;save();
+ }
+ if(pending||now-lastIssued<11000||now-quoteEpoch<30000)return;
+ // Predict pressure of the subsequent *nonoverlapping* 10s window, not price.
+ const last=E.summaryBins(buckets[quote],end-10000,end),previous=E.summaryBins(buckets[quote],end-20000,end-10000),main=E.summaryBins(buckets[quote],end-60000,end),qual=windowData(30,now);
+ const signal=E.estimate(last,previous,main,E.qualify(last,freshVenues(now).length>=2?0:Infinity,now-quoteEpoch,{minTrades:30,minVenues:2,minAge:30000}));
+ if(!qual.ready||signal.side==='ABSTAIN')return;
+ lastIssued=now;pending={issuedAt:now,start:end+1000,until:end+11000,asset,quote,side:signal.side,baseline:last.buyPercent,features:signal.features,reason:signal.reason};
+}
+function setStreak(seconds,state,target,now,valid){
+ if(!valid){state.side='NONE';state.start=0;state.candidate=0;return}
+ if(target===state.side){state.candidate=0;return}
+ if(!state.candidate||state.candidate.side!==target)state.candidate={side:target,at:now};
+ else if(now-state.candidate.at>=3000){state.side=target;state.start=target==='NONE'?0:state.candidate.at;state.candidate=0}
+}
+function fmtDuration(n){return String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0')}
+function drawChart(now){if(now-lastChart<2200)return;lastChart=now;const canvas=$('priceCanvas'),ctx=canvas.getContext('2d');if(!ctx)return;const box=canvas.getBoundingClientRect(),w=Math.max(200,box.width),h=Math.max(140,box.height),dpr=Math.min(2,window.devicePixelRatio||1);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ const values=series[quote].filter(x=>x.t>=now-180000).sort((a,b)=>a.t-b.t);const points=values.filter((x,i)=>i%Math.max(1,Math.ceil(values.length/700))===0);
+ if(points.length<2){ctx.fillStyle='#9aafbb';ctx.font='12px sans-serif';ctx.fillText('Awaiting '+quote+' reference prints',16,h/2);return}
+ let lo=Math.min(...points.map(x=>x.p)),hi=Math.max(...points.map(x=>x.p));const pad=(hi-lo)*.1||hi*.0001;lo-=pad;hi+=pad;const start=points[0].t,end=points[points.length-1].t;
+ ctx.strokeStyle='#2b4657';ctx.lineWidth=1;for(let i=1;i<5;i++){let y=12+(h-25)*i/5;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+ ctx.beginPath();points.forEach((p,i)=>{const x=12+(w-24)*(p.t-start)/Math.max(1,end-start),y=14+(h-36)*(1-(p.p-lo)/(hi-lo));if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y)});ctx.strokeStyle=points.at(-1).p>=points[0].p?'#3cdda8':'#f9748e';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#acc3cc';ctx.font='11px sans-serif';ctx.fillText((quote==='USDT'?'BINANCE':'COINBASE')+' '+asset+'/'+quote+' · 3 MIN',12,13);
+}
+function renderFrames(now){
+ const frames=FRAMES.map(sec=>{const d=windowData(sec,now),direction=d.ready?E.direction(d.w.buyPercent,55,2):'UNKNOWN',state=frameStreaks[sec],target=direction==='BUY_DOMINANT'?'BUY':direction==='SELL_DOMINANT'?'SELL':'NONE';setStreak(sec,state,target,now,d.ready);
+ const recent=summarize(10,now),older=E.summaryBins(buckets[quote],Math.floor(now/1000)*1000-20000,Math.floor(now/1000)*1000-10000);
+ const outlook=d.ready?E.estimate(recent,older,d.w,E.qualify(recent,0,now-quoteEpoch,{minTrades:30,minVenues:2,minAge:30000})):{side:'ABSTAIN'};
+ const momentum=recent.buyPercent==null||older.buyPercent==null?null:recent.buyPercent-older.buyPercent;
+ return {sec,...d,direction,state,outlook,momentum}});
+ const map=new Map(frames.map(x=>[x.sec,x])),p=map.get(+$('pressureFrame').value),s=map.get(+$('streakFrame').value),o=map.get(+$('outlookFrame').value);
+ set('buyPercent',p.ready?percent(p.w.buyPercent):'—');set('sellPercent',p.ready?percent(100-p.w.buyPercent):'—');
+ $('pressureFill').style.width=(p.ready?p.w.buyPercent:0)+'%';$('pressureBar').classList.toggle('empty',!p.ready);
+ set('dominance',p.ready?p.direction.replace('_',' '):p.status);
+ $('dominance').className=p.ready&&p.direction==='BUY_DOMINANT'?'positive':p.ready&&p.direction==='SELL_DOMINANT'?'negative':'neutral';
+ set('momentum',p.momentum==null?'—':(p.momentum>=0?'+':'')+p.momentum.toFixed(1)+'pp');
+ set('trendExplanation',p.ready?'Full '+frameName(p.sec)+' window · '+p.w.count+' trades · '+p.w.venueCount+' '+quote+' venues':'No complete/healthy '+frameName(p.sec)+' window. Partial values withheld.');
+ set('quality',p.status+(p.ready?' · '+p.w.count.toLocaleString()+' prints':' · '+p.progress+'% elapsed'));
+ for(const side of ['BUY','SELL']){const id=side==='BUY'?'buy':'sell',t=s.ready&&s.state.side===side?Math.floor((now-s.state.start)/1000):0;set(id+'Streak',fmtDuration(t));set(id+'Strength',t?'DOMINANCE HELD':'NO STREAK');set(id+'StreakDetail',t?'Observed dominance '+fmtDuration(t)+' ('+frameName(s.sec)+')':'No confirmed dominance');$(id+'Meter').style.width=Math.min(100,t/180*100)+'%';$(id+'Tile').dataset.level=t>=180?4:t>=60?3:t>=25?2:t>0?1:0}
+ set('forecastDirection',o.ready?(o.outlook.side==='ABSTAIN'?'WAIT / NO EDGE':o.outlook.side+' PRESSURE POSSIBLE'):'WAIT · '+o.status);
+ $('forecastDirection').className=o.ready&&o.outlook.side==='BUY'?'positive':o.ready&&o.outlook.side==='SELL'?'negative':'neutral';
+ set('forecastReason',o.ready?o.outlook.reason:'Awaiting sufficient '+frameName(o.sec)+' observations');
+ set('forecastTrack',frameName(o.sec)+' / '+quote+' context');
+ if(!$('framePicks').children.length)$('framePicks').innerHTML=FRAMES.map(sec=>'<label class="frame-chip"><input type="checkbox" data-frame="'+sec+'" '+(selected.has(sec)?'checked':'')+'>'+frameName(sec)+'</label>').join('');
+ else for(const input of $('framePicks').querySelectorAll('[data-frame]'))input.checked=selected.has(+input.dataset.frame);
+ const chosen=[...selected].sort((a,b)=>a-b).map(sec=>map.get(sec));
+ $('frameRows').innerHTML=chosen.map(x=>{
+ const streak=x.ready&&x.state.side!=='NONE'?x.state.side+' '+fmtDuration(Math.floor((now-x.state.start)/1000)):'—',momentum=x.momentum==null?'—':(x.momentum>=0?'+':'')+x.momentum.toFixed(1)+'pp';
+ return '<div class="upgrade-row"><b>'+frameName(x.sec)+'</b><div><span class="positive">'+(x.ready?percent(x.w.buyPercent):'—')+'</span> <span class="negative">'+(x.ready?percent(100-x.w.buyPercent):'—')+'</span><div class="upbar"><i style="width:'+(x.ready?x.w.buyPercent:0)+'%"></i></div></div><div>'+(!x.ready?'—':x.direction.replace('_',' '))+'</div><div>'+momentum+'</div><div>'+streak+'</div><div>'+(!x.ready?'WAIT':x.outlook.side==='ABSTAIN'?'NO EDGE':x.outlook.side+'?')+'</div><small>'+(x.ready?'QUALIFIED':x.status+' '+x.progress+'%')+'</small></div>'
+ }).join('')||'<p class="empty">Select at least one timeframe</p>';
+ const c=E.consensus(chosen.map(x=>({ready:x.ready,share:x.w.buyPercent,direction:x.direction})));
+ const aligned=c.status==='ALIGNED',direction=c.status==='CONFLICT'?'CONFLICT · WITHHOLD SIGNAL':c.status==='WARMUP'?'WAIT / MORE HISTORY':aligned?c.leader+' DOMINANCE CONFIRMED':'MIXED / NEUTRAL';
+ set('bossRegime',direction);set('bossDominance',direction);$('bossRegime').className=$('bossDominance').className=aligned?(c.leader==='BUY'?'positive':'negative'):'neutral';
+ set('bossBuyPct',aligned?percent(c.share):'—');set('bossSellPct',aligned?percent(100-c.share):'—');$('bossPressureFill').style.width=(aligned?c.share:0)+'%';
+ set('bossPressureStatus',c.status);set('bossAgreement',c.alignment==null?'—':Math.round(c.alignment)+'%');set('bossCoverage',c.qualified+' / '+c.selected);set('bossReliability',c.status);set('bossWindowCount',c.qualified+' / '+c.selected+' qualified');set('bossConflict',c.alignment==null?'Unverified':Math.round(c.alignment)+'% aligned');
+ set('bossRawMean','Descriptive mean: '+(c.mean==null?'—':percent(c.mean))+' · not a signal');
+ const explanation=c.status==='CONFLICT'?'Timeframes disagree; no directional master reading.':c.status==='WARMUP'?'Need two complete qualified windows.':aligned?'Observed aligned aggressor flow; price confirmation is separate.':'Weak or mixed directional agreement.';
+ set('bossReason',explanation);set('bossPressureExplain',explanation);set('bossBuy',c.buys+' BUY');set('bossSell',c.sells+' SELL');$('bossFill').style.width=(aligned?c.share:0)+'%';
+ const votes=chosen.filter(x=>x.ready&&x.outlook.side!=='ABSTAIN'),vb=votes.filter(x=>x.outlook.side==='BUY').length,vs=votes.filter(x=>x.outlook.side==='SELL').length;
+ const good=votes.length>=2&&Math.max(vb,vs)>=2&&!(vb&&vs)&&Math.max(vb,vs)/votes.length>=.7;
+ set('bossOutlook',good?(vb>vs?'BUY':'SELL')+' PRESSURE POSSIBLE':'WAIT / NO EDGE');
+ $('bossOutlook').className=good?(vb>vs?'positive':'negative'):'neutral';
+ set('bossForecastReason',good?'Correlated timeframe contexts agree. Price confirmation required.':'No verified directional agreement across complete windows.');
+ return {chosen,p,c};
+}
+function render(){
+ if(document.hidden)return;const now=Date.now();
+ for(const side of ['USD','USDT'])for(const sec of buckets[side].keys())if(sec<Math.floor((now-3660000)/1000))buckets[side].delete(sec);
+ research(now);
+ const w=windowData(60,now).w,ref=references[quote],venue=quote==='USDT'?'Binance':'Coinbase',fresh=ref&&now-ref.receivedAt<9000;
+ const active=VENUES.filter(n=>feeds[n]?.lastTrade&&now-feeds[n].lastTrade<15000).length,connected=VENUES.filter(n=>feeds[n]?.ws?.readyState===WebSocket.OPEN).length;
+ $('statusLed').classList.toggle('active',active>0);set('connectionState',active+' RECEIVING · '+connected+' CONNECTED');
+ set('referencePrice',fresh?fmtPrice(ref.price)+' '+quote:'—');set('referenceLabel',venue+' · '+asset+'/'+quote+' spot, not consolidated');set('referenceAge',fresh?'Trade '+fmtLocal(ref.time)+' · '+Math.round((now-ref.receivedAt)/1000)+'s ago':'No fresh '+venue+' reference price');
+ set('referenceLatency',fresh?Math.max(0,Math.round(ref.receivedAt-ref.time))+'ms':'—');
+ set('referenceSkew',fresh&&ref.receivedAt<ref.time?' · negative clock skew':'');
+ set('buyNotional',money(w.buy));set('sellNotional',money(w.sell));set('netDelta',w.count?(w.buy>=w.sell?'+':'−')+money(Math.abs(w.buy-w.sell)):'—');
+ set('sampleInfo',w.count.toLocaleString()+' prints / '+w.venueCount+' '+quote+' venues · 60s');
+ set('timezone',Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC');
+ set('symbolCode',asset+'/'+quote+' · '+venue+' spot');
+ const f=renderFrames(now);
+ const last=summarize(10,now),before=E.summaryBins(buckets[quote],Math.floor(now/1000)*1000-20000,Math.floor(now/1000)*1000-10000);
+ set('trend30',percent(summarize(30,now).buyPercent));set('trend60',percent(w.buyPercent));
+ set('forecastCountdown',pending?Math.max(0,Math.ceil((pending.until-now)/1000))+'s':'—');
+ const valid=results.filter(x=>x.asset===asset&&x.quote===quote),flow=E.benchmark(valid),priceRecords=valid.filter(x=>x.priceResult==='CORRECT'||x.priceResult==='WRONG'),priceHits=priceRecords.filter(x=>x.priceResult==='CORRECT').length;
+ const priceCI=E.wilson(priceHits,priceRecords.length);set('empiricalRate',flow.total>=30?flow.interval.rate.toFixed(1)+'% · '+flow.total+' forward samples':'UNVERIFIED · '+flow.total+'/30 samples');
+ set('forecastStatus',flow.total+' scored future windows');set('flowHitRate',flow.total?flow.interval.rate.toFixed(1)+'% ('+flow.total+') · CI '+flow.interval.low.toFixed(0)+'–'+flow.interval.high.toFixed(0)+'%':'—');
+ set('priceHitRate',priceCI?priceCI.rate.toFixed(1)+'% ('+priceRecords.length+')':'—');
+ set('benchmarkRate',flow.baseline==null?'—':'Always-majority baseline '+flow.baseline.toFixed(1)+'%');set('priceAccuracy',priceCI&&priceRecords.length>=30?priceCI.rate.toFixed(1)+'% / '+priceRecords.length:'Unverified · '+priceRecords.length+'/30');
+ set('validationCount',flow.total>=100?'Research sample only · not an out-of-sample guarantee':flow.total+' / 100 desired checks (collecting)');
+ set('lastOutcome',lastResult?lastResult.side+' PRESSURE: '+lastResult.flowResult:'No completed check');set('outcomeDetails',lastResult?'Δ flow '+(lastResult.flowDelta==null?'—':lastResult.flowDelta.toFixed(2)+'pp')+' · price '+(lastResult.returnPct==null?'—':lastResult.returnPct.toFixed(3)+'%'):'Waiting for future execution');
+ set('observations',valid.length+' verified or invalid labels');
+ set('totalReceived',total.toLocaleString()+' received');set('bufferSize',raw.length+' stored · newest 75 displayed');
+ set('lastVenue',lastPrint?lastPrint.venue+' '+lastPrint.asset+'/'+lastPrint.quote+' · '+fmtLocal(lastPrint.time):'No verified trade');
+ const refSeries=series[quote].filter(x=>x.t>=now-30000).sort((a,b)=>a.t-b.t),old=refSeries[0],latest=refSeries.at(-1);
+ const ret=old&&latest?100*(latest.p/old.p-1):null;
+ set('priceReturn',ret==null?'—':(ret>=0?'+':'')+ret.toFixed(3)+'%');
+ const delta=last.buyPercent==null||before.buyPercent==null?null:last.buyPercent-before.buyPercent;
+ const resp=ret==null||w.count<40?'INSUFFICIENT DATA':Math.abs(ret)<.015&&Math.abs(delta||0)>5?'POSSIBLE ABSORPTION':ret>0&&w.buyPercent>=55?'BUY PRESSURE CONFIRMED':ret<0&&w.buyPercent<=45?'SELL PRESSURE CONFIRMED':'FLOW / PRICE DIVERGENCE';
+ set('priceResponse',resp);
+ set('responseDescription','Pressure '+percent(w.buyPercent)+' vs same-venue 30s price change '+(ret==null?'—':ret.toFixed(3)+'%')+'. No causality inferred.');
+ set('activeVenues',freshVenues(now).length+' / '+VENUES.filter(n=>marketQuote(n)===quote).length);
+ const conc=E.concentration(w);set('venueConcentration',conc==null?'—':percent(100*conc));
+ const venueList=[...w.byVenue.entries()].sort((a,b)=>(b[1].buy+b[1].sell)-(a[1].buy+a[1].sell));
+ $('venueAttribution').innerHTML=venueList.length?venueList.map(([name,v])=>'<div class="attribution-row"><strong>'+name+'</strong><span>'+money(v.buy)+' buy</span><span>'+money(v.sell)+' sell</span><span>'+percent(100*(v.buy+v.sell)/Math.max(1,w.buy+w.sell))+' share</span></div>').join(''):'<p class="muted">Awaiting observations from '+quote+' markets.</p>';
+ $('venueRows').innerHTML=VENUES.map(n=>{const v=feeds[n],age=v.lastTrade?Math.floor((now-v.lastTrade)/1000)+'s':'never',fresh=v.lastTrade&&now-v.lastTrade<15000;
+ return '<div class="venue-row"><span><i class="led-small '+(fresh?'good':'')+'"></i><b>'+n+'</b><small>'+asset+'/'+marketQuote(n)+'</small></span><span class="venue-right">'+(v.disabled?'UNSUPPORTED':fresh?'RECEIVING':v.status)+'<small>'+v.count.toLocaleString()+' prints · '+age+' · '+(v.error||'')+'</small></span></div>'}).join('');
+ const filter=$('filterVenue').value,side=$('filterSide').value,min=Math.max(0,Number($('minTrade').value)||0);
+ if(now-lastTape>=2200||displayVersion!==total){lastTape=now;displayVersion=total;
+ const matches=raw.filter(t=>(filter==='ALL'||filter===t.venue)&&(side==='ALL'||side===t.side)&&t.value>=min).slice(-260).sort((a,b)=>b.time-a.time).slice(0,75);
+ $('tapeRows').innerHTML=matches.length?matches.map(t=>'<tr><td>'+fmtLocal(t.time)+'</td><td>'+t.venue+'<small>'+t.quote+'</small></td><td class="'+(t.side==='BUY'?'positive':'negative')+'">'+t.side+'</td><td>'+fmtPrice(t.price)+' '+t.quote+'</td><td>'+money(t.value)+'</td></tr>').join(''):'<tr><td colspan="5" class="empty">No matching genuine executions received</td></tr>'; }
+ $('historyRows').innerHTML=valid.slice(-12).reverse().map(x=>'<tr><td>'+fmtLocal(x.issuedAt)+'</td><td>'+x.side+'</td><td>'+x.flowResult+'</td><td>'+(x.flowDelta==null?'—':x.flowDelta.toFixed(1)+'pp')+' / '+(x.returnPct==null?'—':x.returnPct.toFixed(3)+'%')+'</td></tr>').join('')||'<tr><td colspan="4" class="empty">No scored forward samples yet</td></tr>';
+ drawChart(now);
+}
+document.querySelectorAll('[data-symbol]').forEach(b=>b.addEventListener('click',()=>{asset=b.dataset.symbol;try{localStorage.setItem(selectedKey,asset)}catch{}resetMarket()}));
+$('quoteSelect').addEventListener('change',e=>{quote=e.target.value;quoteEpoch=Date.now();pending=null;lastIssued=0;frameStreaks=Object.fromEntries(FRAMES.map(s=>[s,{side:'NONE',candidate:0,since:0}]));render()});
+for(const id of ['pressureFrame','streakFrame','outlookFrame'])$(id).addEventListener('change',render);
+$('framePicks').addEventListener('change',e=>{if(!e.target.matches('[data-frame]'))return;const s=Number(e.target.dataset.frame);if(e.target.checked)selected.add(s);else selected.delete(s);render()});
+$('selectAllFrames').addEventListener('click',()=>{selected=new Set(FRAMES);render()});
+$('focusFrames').addEventListener('click',()=>{selected=new Set([30,60,300]);render()});
+$('reconnect').addEventListener('click',()=>{for(const n of VENUES)if(!feeds[n].disabled)connect(n);render()});
+['filterVenue','filterSide','minTrade'].forEach(id=>$(id).addEventListener('input',()=>{lastTape=0;displayVersion=-1;render()}));
+$('clearOutcomes').addEventListener('click',()=>{results=results.filter(x=>x.asset!==asset||x.quote!==quote);save();render()});
+document.querySelectorAll('.section-nav a').forEach(el=>el.addEventListener('click',()=>{document.querySelectorAll('.section-nav a').forEach(a=>a.classList.toggle('nav-active',a===el))}));
+window.addEventListener('resize',()=>{lastChart=0;drawChart(Date.now())});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){pending=null}else{quoteEpoch=Date.now();watchdog();render()}});
+window.addEventListener('online',watchdog);
+set('timezone',Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC');
+resetMarket();setInterval(()=>{if(!document.hidden)render()},1000);setInterval(watchdog,7500);
 })();
